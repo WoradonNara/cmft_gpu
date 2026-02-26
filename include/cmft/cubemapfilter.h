@@ -66,6 +66,17 @@ namespace cmft
         };
     };
 
+    struct RadianceFilterProcessing
+    {
+        enum Enum
+        {
+            Auto,
+            CpuOnly,
+            Hybrid,
+            GpuOnly,
+        };
+    };
+
     /// Helper functions.
     float specularPowerFor(float _mip, float _mipCount, float _glossScale, float _glossBias);
     float applyLightningModel(float _specularPower, LightingModel::Enum _lightingModel);
@@ -87,6 +98,22 @@ namespace cmft
                            , AllocatorI* _allocator = g_allocator
                            );
 
+    /// Creates radiance cubemap image with explicit processing mode.
+    bool imageRadianceFilter(Image& _dst
+                           , uint32_t _dstFaceSize
+                           , LightingModel::Enum _lightingModel
+                           , bool _excludeBase
+                           , uint8_t _mipCount
+                           , uint8_t _glossScale
+                           , uint8_t _glossBias
+                           , const Image& _src
+                           , EdgeFixup::Enum _edgeFixup
+                           , uint8_t _numCpuProcessingThreads
+                           , ClContext* _clContext
+                           , RadianceFilterProcessing::Enum _processingMode
+                           , AllocatorI* _allocator = g_allocator
+                           );
+
     /// Converts cubemap image into radiance cubemap.
     bool imageRadianceFilter(Image& _image
                            , uint32_t _dstFaceSize
@@ -98,6 +125,21 @@ namespace cmft
                            , EdgeFixup::Enum _edgeFixup = EdgeFixup::None
                            , uint8_t _numCpuProcessingThreads = 0
                            , ClContext* _clContext = NULL
+                           , AllocatorI* _allocator = g_allocator
+                           );
+
+    /// Converts cubemap image into radiance cubemap with explicit processing mode.
+    bool imageRadianceFilter(Image& _image
+                           , uint32_t _dstFaceSize
+                           , LightingModel::Enum _lightingModel
+                           , bool _excludeBase
+                           , uint8_t _mipCount
+                           , uint8_t _glossScale
+                           , uint8_t _glossBias
+                           , EdgeFixup::Enum _edgeFixup
+                           , uint8_t _numCpuProcessingThreads
+                           , ClContext* _clContext
+                           , RadianceFilterProcessing::Enum _processingMode
                            , AllocatorI* _allocator = g_allocator
                            );
 

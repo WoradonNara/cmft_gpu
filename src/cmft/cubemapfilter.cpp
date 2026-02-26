@@ -1854,6 +1854,19 @@ namespace cmft
         };
     }
 
+    static RadianceFilterProcessing::Enum radianceProcessingModeFromLegacyParams(uint8_t _numCpuProcessingThreads, ClContext* _clContext)
+    {
+        const bool hasCpuWorkers = (0 != _numCpuProcessingThreads);
+        const bool hasClContext = (NULL != _clContext);
+
+        if (hasClContext)
+        {
+            return hasCpuWorkers ? RadianceFilterProcessing::Hybrid : RadianceFilterProcessing::GpuOnly;
+        }
+
+        return RadianceFilterProcessing::CpuOnly;
+    }
+
     bool imageRadianceFilter(Image& _dst
                            , uint32_t _dstFaceSize
                            , LightingModel::Enum _lightingModel
@@ -1865,6 +1878,25 @@ namespace cmft
                            , EdgeFixup::Enum _edgeFixup
                            , uint8_t _numCpuProcessingThreads
                            , ClContext* _clContext
+                           , AllocatorI* _allocator
+                           )
+    {
+        const RadianceFilterProcessing::Enum processingMode = radianceProcessingModeFromLegacyParams(_numCpuProcessingThreads, _clContext);
+        return imageRadianceFilter(_dst, _dstFaceSize, _lightingModel, _excludeBase, _mipCount, _glossScale, _glossBias, _src, _edgeFixup, _numCpuProcessingThreads, _clContext, processingMode, _allocator);
+    }
+
+    bool imageRadianceFilter(Image& _dst
+                           , uint32_t _dstFaceSize
+                           , LightingModel::Enum _lightingModel
+                           , bool _excludeBase
+                           , uint8_t _mipCount
+                           , uint8_t _glossScale
+                           , uint8_t _glossBias
+                           , const Image& _src
+                           , EdgeFixup::Enum _edgeFixup
+                           , uint8_t _numCpuProcessingThreads
+                           , ClContext* _clContext
+                           , RadianceFilterProcessing::Enum _processingMode
                            , AllocatorI* _allocator
                            )
     {
@@ -1912,20 +1944,70 @@ namespace cmft
             }
         }
 
-        // Check at least some processig device is valid and choosen for filtering.
-        if (0 == maxActiveCpuThreads && !s_radianceProgram.isValid())
+        const bool clProgramValid = s_radianceProgram.isValid();
+
+        bool useCpu = false;
+        bool useGpu = false;
+        switch (_processingMode)
+        {
+            case RadianceFilterProcessing::CpuOnly:
+                useCpu = (maxActiveCpuThreads != 0);
+                useGpu = false;
+                break;
+
+            case RadianceFilterProcessing::Hybrid:
+                useCpu = (maxActiveCpuThreads != 0);
+                useGpu = clProgramValid;
+                break;
+
+            case RadianceFilterProcessing::GpuOnly:
+                useCpu = false;
+                useGpu = clProgramValid;
+                break;
+
+            case RadianceFilterProcessing::Auto:
+            default:
+                useCpu = (maxActiveCpuThreads != 0);
+                useGpu = clProgramValid;
+                break;
+        }
+
+        // Validate explicit processing mode requirements.
+        if (RadianceFilterProcessing::GpuOnly == _processingMode && !useGpu)
+        {
+            WARN("Radiance -> GPU-only processing mode requires a valid OpenCL device and program.");
+            return false;
+        }
+
+        if (RadianceFilterProcessing::CpuOnly == _processingMode && !useCpu)
+        {
+            WARN("Radiance -> CPU-only processing mode requires at least one CPU processing thread.");
+            return false;
+        }
+
+        if (RadianceFilterProcessing::Hybrid == _processingMode && (!useCpu || !useGpu))
+        {
+            WARN("Radiance -> Hybrid processing mode requires both CPU processing threads and a valid OpenCL device.");
+            return false;
+        }
+
+        // Check at least some processing device is valid and chosen for filtering.
+        if (!useCpu && !useGpu)
         {
             WARN("No hardware devices selected for processing."
-                " OpenCL context is invalid and 0 CPU processing theads are choosen for filtering."
+                " OpenCL context is invalid and 0 CPU processing threads are chosen for filtering."
                 );
 
             return false;
         }
 
+        const uint32_t cpuThreadBudget = useCpu ? maxActiveCpuThreads : 0;
+
         // Don't use the same CPU device for OpenCL and CPU processing!
         if (NULL != _clContext
         &&  _clContext->m_deviceType&CL_DEVICE_TYPE_CPU
-        &&  maxActiveCpuThreads != 0)
+        &&  useCpu
+        &&  useGpu)
         {
             WARN(" !! Choosing CPU device as OpenCL device and running CPU processing"
                  " threads on the SAME device is NOT a good idea. It will work, but it is"
@@ -2060,121 +2142,173 @@ namespace cmft
             // Build cubemap vectors.
             float* cubemapVectors = buildCubemapNormalSolidAngle(imageRgba32f.m_width, _edgeFixup, &g_crtAllocator);
 
+            bool gpuReady = useGpu && s_radianceProgram.isValid();
+
             // Enqueue memory transfer for cl device.
-            if (s_radianceProgram.isValid())
+            if (gpuReady)
             {
                 const bool success = s_radianceProgram.initDeviceMemory(imageRgba32f, cubemapVectors);
                 if (!success)
                 {
                     s_radianceProgram.invalidate();
+                    gpuReady = false;
                 }
             }
 
-            // Start global timer.
-            s_globalState.reset();
-            s_globalState.m_startTime = cmft::getHPCounter();
-            s_globalState.m_totalTasks = mipCount*6;
-            INFO("Radiance -> Starting filter...");
-
-            INFO("Radiance -> Utilizing %u CPU processing thread%s%s%s."
-                , maxActiveCpuThreads
-                , maxActiveCpuThreads==1?"":"s"
-                , !s_radianceProgram.isValid()?"":" and "
-                , !s_radianceProgram.isValid()?"":s_radianceProgram.m_clContext->m_deviceName
-                );
-
-            // Alloc data for tasks parameters.
-            const uint8_t mipStart = uint8_t(_excludeBase);
-            RadianceFilterTaskList taskList(mipStart, mipCount);
-
-            const float mipCountf   = float(int32_t(mipCount));
-            const float glossScalef = float(int32_t(_glossScale));
-            const float glossBiasf  = float(int32_t(_glossBias));
-
-            //Prepare processing tasks parameters.
-            for (uint32_t mip = mipStart; mip < mipCount; ++mip)
+            bool processingSuccess = true;
+            if (RadianceFilterProcessing::GpuOnly == _processingMode && !gpuReady)
             {
-                // Determine filter parameters.
-                const uint32_t mipFaceSize = CMFT_MAX(1, dstFaceSize >> mip);
-                const float mipFaceSizef = float(int32_t(mipFaceSize));
-                const float minAngle = atan2f(1.0f, mipFaceSizef);
-                const float maxAngle = (0.5f*CMFT_PI);
-                const float toFilterSize = 1.0f/(minAngle*mipFaceSizef*2.0f);
-                const float specularPowerRef = specularPowerFor(float(int32_t(mip)), mipCountf, glossScalef, glossBiasf);
-                const float specularPower = applyLightningModel(specularPowerRef, _lightingModel);
-                const float filterAngle = CMFT_CLAMP(cosinePowerFilterAngle(specularPower), minAngle, maxAngle);
-                const float cosAngle = CMFT_MAX(0.0f, cosf(filterAngle));
-                const float texelSize = 1.0f/mipFaceSizef;
-                const float filterSize = CMFT_MAX(texelSize, filterAngle * toFilterSize);
+                WARN("Radiance -> GPU-only mode failed because OpenCL setup did not complete.");
+                processingSuccess = false;
+            }
 
-                for (uint8_t face = 0; face < 6; ++face)
+            if (RadianceFilterProcessing::Hybrid == _processingMode && !gpuReady)
+            {
+                WARN("Radiance -> Hybrid mode failed because OpenCL setup did not complete.");
+                processingSuccess = false;
+            }
+
+            if (!gpuReady && 0 == cpuThreadBudget)
+            {
+                WARN("Radiance -> No processing devices available after OpenCL initialization.");
+                processingSuccess = false;
+            }
+
+            if (processingSuccess)
+            {
+                // Start global timer.
+                s_globalState.reset();
+                s_globalState.m_startTime = cmft::getHPCounter();
+                s_globalState.m_totalTasks = mipCount*6;
+                INFO("Radiance -> Starting filter...");
+
+                INFO("Radiance -> Utilizing %u CPU processing thread%s%s%s."
+                    , cpuThreadBudget
+                    , cpuThreadBudget==1?"":"s"
+                    , !gpuReady?"":" and "
+                    , !gpuReady?"":s_radianceProgram.m_clContext->m_deviceName
+                    );
+
+                // Alloc data for tasks parameters.
+                const uint8_t mipStart = uint8_t(_excludeBase);
+                RadianceFilterTaskList taskList(mipStart, mipCount);
+
+                const float mipCountf   = float(int32_t(mipCount));
+                const float glossScalef = float(int32_t(_glossScale));
+                const float glossBiasf  = float(int32_t(_glossBias));
+
+                //Prepare processing tasks parameters.
+                for (uint32_t mip = mipStart; mip < mipCount; ++mip)
                 {
-                    float* dstPtr = (float*)((uint8_t*)dstData + dstOffsets[face][mip]);
+                    // Determine filter parameters.
+                    const uint32_t mipFaceSize = CMFT_MAX(1, dstFaceSize >> mip);
+                    const float mipFaceSizef = float(int32_t(mipFaceSize));
+                    const float minAngle = atan2f(1.0f, mipFaceSizef);
+                    const float maxAngle = (0.5f*CMFT_PI);
+                    const float toFilterSize = 1.0f/(minAngle*mipFaceSizef*2.0f);
+                    const float specularPowerRef = specularPowerFor(float(int32_t(mip)), mipCountf, glossScalef, glossBiasf);
+                    const float specularPower = applyLightningModel(specularPowerRef, _lightingModel);
+                    const float filterAngle = CMFT_CLAMP(cosinePowerFilterAngle(specularPower), minAngle, maxAngle);
+                    const float cosAngle = CMFT_MAX(0.0f, cosf(filterAngle));
+                    const float texelSize = 1.0f/mipFaceSizef;
+                    const float filterSize = CMFT_MAX(texelSize, filterAngle * toFilterSize);
 
-                    RadianceFilterParams taskParams =
+                    for (uint8_t face = 0; face < 6; ++face)
                     {
-                        dstPtr,
-                        face,
-                        mipFaceSize,
-                        filterSize,
-                        specularPower,
-                        cosAngle,
-                        cubemapVectors,
-                        &imageRgba32f,
-                        srcFaceOffsets,
-                        _edgeFixup,
-                    };
+                        float* dstPtr = (float*)((uint8_t*)dstData + dstOffsets[face][mip]);
 
-                    // Enqueue processing parameters.
-                    taskList.set(mip, face, &taskParams);
-                }
-            }
+                        RadianceFilterParams taskParams =
+                        {
+                            dstPtr,
+                            face,
+                            mipFaceSize,
+                            filterSize,
+                            specularPower,
+                            cosAngle,
+                            cubemapVectors,
+                            &imageRgba32f,
+                            srcFaceOffsets,
+                            _edgeFixup,
+                        };
 
-
-            // Output process header info.
-            INFO("Radiance -> ------------------------------------");
-            INFO("Radiance ->  Device / Face /     Time /    Total");
-            INFO("Radiance -> ------------------------------------");
-
-            // Single thread, no OpenCL.
-            if (maxActiveCpuThreads == 1 && !s_radianceProgram.isValid())
-            {
-                radianceFilterCpu((void*)&taskList);
-            }
-            // Multi thread (with or without OpenCL).
-            else
-            {
-                // Start CPU processing threads.
-                while (activeCpuThreads < maxActiveCpuThreads - 1)
-                {
-                    cpuThreads[activeCpuThreads++] = std::thread(radianceFilterCpu, (void*)&taskList);
+                        // Enqueue processing parameters.
+                        taskList.set(mip, face, &taskParams);
+                    }
                 }
 
-                // Start one GPU host thread.
-                if (s_radianceProgram.isValid() && s_radianceProgram.isIdle())
-                {
-                    cpuThreads[activeCpuThreads++] = std::thread(radianceFilterGpu, (void*)&taskList);
-                }
 
-                // Wait for everything to finish.
-                for (uint32_t ii = 0; ii < activeCpuThreads; ++ii)
-                {
-                    cpuThreads[ii].join();
-                }
+                // Output process header info.
+                INFO("Radiance -> ------------------------------------");
+                INFO("Radiance ->  Device / Face /     Time /    Total");
+                INFO("Radiance -> ------------------------------------");
 
-                // OpenCL failed and no CPU threads were selected for procesing.
-                const uint16_t unfinished = taskList.unfinishedCount();
-                if (unfinished > 0 && 0 == maxActiveCpuThreads)
-                {
-                    return false;
-                }
-
-                // Process unfinished tasks on CPU.
-                const uint8_t numThreads = CMFT_MIN(unfinished, maxActiveCpuThreads);
-                for (uint8_t ii = 0; ii < numThreads; ++ii)
+                // Single thread, no OpenCL.
+                if (cpuThreadBudget == 1 && !gpuReady)
                 {
                     radianceFilterCpu((void*)&taskList);
                 }
+                // Multi thread (with or without OpenCL).
+                else
+                {
+                    // Start CPU processing threads.
+                    uint32_t cpuWorkersToLaunch = cpuThreadBudget;
+                    if (gpuReady && cpuWorkersToLaunch > 0)
+                    {
+                        cpuWorkersToLaunch--;
+                    }
+
+                    while (activeCpuThreads < cpuWorkersToLaunch)
+                    {
+                        cpuThreads[activeCpuThreads++] = std::thread(radianceFilterCpu, (void*)&taskList);
+                    }
+
+                    // Start one GPU host thread.
+                    if (gpuReady && s_radianceProgram.isIdle())
+                    {
+                        cpuThreads[activeCpuThreads++] = std::thread(radianceFilterGpu, (void*)&taskList);
+                    }
+
+                    // Wait for everything to finish.
+                    for (uint32_t ii = 0; ii < activeCpuThreads; ++ii)
+                    {
+                        cpuThreads[ii].join();
+                    }
+
+                    // Process unfinished tasks on CPU.
+                    const uint16_t unfinished = taskList.unfinishedCount();
+                    if (unfinished > 0)
+                    {
+                        if (0 == cpuThreadBudget)
+                        {
+                            WARN("Radiance -> %u task(s) left unfinished and CPU fallback is disabled.", unfinished);
+                            processingSuccess = false;
+                        }
+                        else
+                        {
+                            const uint8_t numThreads = CMFT_MIN(unfinished, cpuThreadBudget);
+                            for (uint8_t ii = 0; ii < numThreads; ++ii)
+                            {
+                                radianceFilterCpu((void*)&taskList);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!processingSuccess)
+            {
+                CMFT_FREE(&g_crtAllocator, cubemapVectors);
+                imageUnload(imageRgba32f, _allocator);
+                CMFT_FREE(&g_crtAllocator, dstData);
+
+                if (s_radianceProgram.isValid())
+                {
+                    s_radianceProgram.releaseDeviceMemory();
+                    s_radianceProgram.destroy();
+                }
+                s_globalState.reset();
+
+                return false;
             }
 
             // Average 1x1 face size.
@@ -2261,8 +2395,26 @@ namespace cmft
                            , AllocatorI* _allocator
                            )
     {
+        const RadianceFilterProcessing::Enum processingMode = radianceProcessingModeFromLegacyParams(_numCpuProcessingThreads, _clContext);
+        return imageRadianceFilter(_image, _dstFaceSize, _lightingModel, _excludeBase, _mipCount, _glossScale, _glossBias, _edgeFixup, _numCpuProcessingThreads, _clContext, processingMode, _allocator);
+    }
+
+    bool imageRadianceFilter(Image& _image
+                           , uint32_t _dstFaceSize
+                           , LightingModel::Enum _lightingModel
+                           , bool _excludeBase
+                           , uint8_t _mipCount
+                           , uint8_t _glossScale
+                           , uint8_t _glossBias
+                           , EdgeFixup::Enum _edgeFixup
+                           , uint8_t _numCpuProcessingThreads
+                           , ClContext* _clContext
+                           , RadianceFilterProcessing::Enum _processingMode
+                           , AllocatorI* _allocator
+                           )
+    {
         Image tmp;
-        if (imageRadianceFilter(tmp, _dstFaceSize, _lightingModel, _excludeBase, _mipCount, _glossScale, _glossBias, _image, _edgeFixup, _numCpuProcessingThreads, _clContext, _allocator))
+        if (imageRadianceFilter(tmp, _dstFaceSize, _lightingModel, _excludeBase, _mipCount, _glossScale, _glossBias, _image, _edgeFixup, _numCpuProcessingThreads, _clContext, _processingMode, _allocator))
         {
             imageMove(_image, tmp, _allocator);
             return true;
