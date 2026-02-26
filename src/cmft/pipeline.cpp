@@ -275,6 +275,7 @@ namespace cmft
                               , _request.m_edgeFixup
                               , uint8_t(_request.m_numCpuProcessingThreads)
                               , clContext
+                              , _request.m_processingMode
                               );
 
             clDestroy(clContext);

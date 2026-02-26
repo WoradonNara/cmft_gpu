@@ -86,6 +86,15 @@ static const CliOptionMap s_deviceType[] =
     CLI_OPTION_MAP_TERMINATOR,
 };
 
+static const CliOptionMap s_processingMode[] =
+{
+    { "auto",    (uint32_t)RadianceFilterProcessing::Auto    },
+    { "cpuOnly", (uint32_t)RadianceFilterProcessing::CpuOnly },
+    { "hybrid",  (uint32_t)RadianceFilterProcessing::Hybrid  },
+    { "gpuOnly", (uint32_t)RadianceFilterProcessing::GpuOnly },
+    CLI_OPTION_MAP_TERMINATOR,
+};
+
 static const CliOptionMap s_validFileTypes[] =
 {
     { "dds", ImageFileType::DDS },
@@ -220,6 +229,7 @@ struct InputParameters
 
     // Processing devices.
     uint32_t m_numCpuProcessingThreads;
+    uint32_t m_processingMode;
     bool m_useOpenCL;
     uint32_t m_clVendor;
     char m_vendorStrPart[1024];
@@ -326,6 +336,7 @@ void inputParametersFromCommandLine(InputParameters& _inputParameters, const cmf
 
     // Processing devices.
     _cmdLine.hasArg(_inputParameters.m_numCpuProcessingThreads, '\0', "numCpuProcessingThreads");
+    valueFromOptionMap(_inputParameters.m_processingMode, s_processingMode, _cmdLine.findOption("processingMode"));
     _cmdLine.hasArg(_inputParameters.m_useOpenCL, '\0', "useOpenCL");
 
     // Cl vendor.
@@ -537,6 +548,7 @@ void inputParametersDefault(InputParameters& _inputParameters)
 
     // Processing devices.
     _inputParameters.m_numCpuProcessingThreads = UINT32_MAX;
+    _inputParameters.m_processingMode          = RadianceFilterProcessing::Auto;
     _inputParameters.m_useOpenCL               = true;
     _inputParameters.m_deviceIndex             = 0;
     _inputParameters.m_clVendor                = CMFT_CL_VENDOR_ANY_GPU;
@@ -594,6 +606,7 @@ void pipelineRequestFromInputParameters(PipelineRequest& _request, const InputPa
     _request.m_dstFaceSize   = _inputParameters.m_dstFaceSize;
     _request.m_lightingModel = (LightingModel::Enum)_inputParameters.m_lightingModel;
     _request.m_edgeFixup     = (EdgeFixup::Enum)_inputParameters.m_edgeFixup;
+    _request.m_processingMode = (RadianceFilterProcessing::Enum)_inputParameters.m_processingMode;
 
     // Processing devices.
     _request.m_numCpuProcessingThreads = _inputParameters.m_numCpuProcessingThreads;
@@ -757,6 +770,7 @@ void printHelp()
             "         --lightingModel phongbrdf\n"
             "         --dstFaceSize 256\n"
             "         --numCpuProcessingThreads 4\n"
+            "         --processingMode hybrid\n"
             "         --useOpenCL true\n"
             "         --clVendor anyGpuVendor\n"
             "         --deviceType gpu\n"
@@ -845,6 +859,11 @@ void printHelp()
             "          none\n"
             "          warp\n"
             "    --numCpuProcessingThreads <uint>   Should not be bigger than the number of physical CPU cores/threads. [radiance filter param]\n"
+            "    --processingMode <mode>            Processing strategy for radiance filter. 'gpuOnly' is strict and does not fall back to CPU. [radiance filter param]\n"
+            "          auto\n"
+            "          cpuOnly\n"
+            "          hybrid\n"
+            "          gpuOnly\n"
             "    --useOpenCL <bool>                 OpenCL processing can be used alongside processing on CPU. Therefore, OpenCL device should be GPU. [radiance filter param]\n"
             "    --clVendor <vendor>                This parameter should generally be 'anyGpuVendor'. If other vendor is to be choosen, type in part of the vendor name. Use 'cmft --printCLDevices' to list available devices and vendors. [radiance filter param]\n"
             "          intel\n"

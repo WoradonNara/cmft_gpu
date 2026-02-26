@@ -81,6 +81,7 @@ namespace cmft
             m_dstFaceSize   = 0;
             m_lightingModel = LightingModel::Phong;
             m_edgeFixup     = EdgeFixup::None;
+            m_processingMode = RadianceFilterProcessing::Auto;
 
             // Processing devices.
             m_numCpuProcessingThreads = UINT32_MAX;
@@ -134,6 +135,7 @@ namespace cmft
         uint32_t m_dstFaceSize;
         LightingModel::Enum m_lightingModel;
         EdgeFixup::Enum m_edgeFixup;
+        RadianceFilterProcessing::Enum m_processingMode;
 
         // Processing devices.
         uint32_t m_numCpuProcessingThreads;
