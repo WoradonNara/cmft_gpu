@@ -20,6 +20,55 @@ Download
 - Supported input/output types: cubemap, cube cross, latlong, face list, horizontal/vertical strip, octant.
 
 
+Embedding (C++ API)
+------------
+
+cmft can now be integrated as a C++ pipeline API without spawning a separate `cmft` executable.
+
+```cpp
+#include <cmft/pipeline.h>
+
+cmft::PipelineRequest request;
+request.m_inputFilePath = "studio.hdr";
+request.m_filterType = cmft::PipelineFilterType::Radiance;
+request.m_srcFaceSize = 256;
+request.m_dstFaceSize = 256;
+request.m_mipCount = 9;
+request.m_glossScale = 10;
+request.m_glossBias = 1;
+request.m_lightingModel = cmft::LightingModel::PhongBrdf;
+
+request.m_processingMode = cmft::RadianceFilterProcessing::GpuOnly;
+request.m_numCpuProcessingThreads = 0;
+request.m_useOpenCL = true;
+
+request.m_outputFilesNum = 1;
+request.m_outputFiles[0].m_fileName = "studio_pmrem";
+request.m_outputFiles[0].m_fileType = cmft::ImageFileType::DDS;
+request.m_outputFiles[0].m_textureFormat = cmft::TextureFormat::BGRA8;
+request.m_outputFiles[0].m_outputType = cmft::OutputType::Cubemap;
+
+cmft::PipelineResult result;
+const int rc = cmft::pipelineRun(request, &result);
+```
+
+
+Radiance processing modes
+------------
+
+- `auto` keeps legacy behavior and infers CPU/GPU usage from `--numCpuProcessingThreads` and OpenCL availability.
+- `cpuOnly` requires at least one CPU processing thread.
+- `hybrid` requires both CPU threads and a valid OpenCL GPU context.
+- `gpuOnly` is strict: no CPU fallback is used if GPU processing fails.
+
+CLI examples:
+
+```
+cmft --input "studio.hdr" --filter radiance --processingMode gpuOnly --numCpuProcessingThreads 0 --useOpenCL true --outputNum 1 --output0 "studio_pmrem" --output0params dds,bgra8,cubemap
+cmft --input "studio.hdr" --filter radiance --processingMode hybrid --numCpuProcessingThreads 4 --useOpenCL true --outputNum 1 --output0 "studio_pmrem" --output0params dds,bgra8,cubemap
+```
+
+
 See it in action - [here](https://github.com/dariomanesku/cmftStudio)
 ------------
 Screenshot from [cmftStudio](https://github.com/dariomanesku/cmftStudio):
