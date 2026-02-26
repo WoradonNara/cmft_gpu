@@ -22,7 +22,7 @@ namespace
         return (NULL != _str && '\0' != _str[0]);
     }
 
-    static void outputShCoeffs(const char* _pathName, double _shCoeffs[cmft::SH_COEFF_NUM][3])
+    static void outputShCoeffs(const char* _pathName, double _shCoeffs[SH_COEFF_NUM][3])
     {
         // Get base name.
         char baseName[128];

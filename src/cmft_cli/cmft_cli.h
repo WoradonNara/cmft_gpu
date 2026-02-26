@@ -17,6 +17,7 @@
 #include <cmft/image.h>
 #include <cmft/cubemapfilter.h>
 #include <cmft/clcontext.h>
+#include <cmft/pipeline.h>
 #include <cmft/print.h>         // setWarningPrintf(), setInfoPrintf()
 
 using namespace cmft;
@@ -547,6 +548,84 @@ void inputParametersDefault(InputParameters& _inputParameters)
     _inputParameters.m_encodeRGBM = false;
 }
 
+void pipelineRequestFromInputParameters(PipelineRequest& _request, const InputParameters& _inputParameters)
+{
+    // Input.
+    _request.m_inputFilePath = _inputParameters.m_inputFilePath;
+    _request.m_inputFacePosX = _inputParameters.m_inputPosXFace;
+    _request.m_inputFaceNegX = _inputParameters.m_inputNegXFace;
+    _request.m_inputFacePosY = _inputParameters.m_inputPosYFace;
+    _request.m_inputFaceNegY = _inputParameters.m_inputNegYFace;
+    _request.m_inputFacePosZ = _inputParameters.m_inputPosZFace;
+    _request.m_inputFaceNegZ = _inputParameters.m_inputNegZFace;
+
+    // Image operations.
+    _request.m_inputGammaPowNumerator    = _inputParameters.m_inputGammaPowNumerator;
+    _request.m_inputGammaPowDenominator  = _inputParameters.m_inputGammaPowDenominator;
+    _request.m_outputGammaPowNumerator   = _inputParameters.m_outputGammaPowNumerator;
+    _request.m_outputGammaPowDenominator = _inputParameters.m_outputGammaPowDenominator;
+    _request.m_generateMipMapChain       = _inputParameters.m_generateMipMapChain;
+
+    // Cubemap rotate/flip.
+    _request.m_imageOpPosX = _inputParameters.m_imageOpPosX;
+    _request.m_imageOpPosY = _inputParameters.m_imageOpPosY;
+    _request.m_imageOpPosZ = _inputParameters.m_imageOpPosZ;
+    _request.m_imageOpNegX = _inputParameters.m_imageOpNegX;
+    _request.m_imageOpNegY = _inputParameters.m_imageOpNegY;
+    _request.m_imageOpNegZ = _inputParameters.m_imageOpNegZ;
+
+    // Filter parameters.
+    switch (_inputParameters.m_filterType)
+    {
+        case FilterType::Radiance:   _request.m_filterType = PipelineFilterType::Radiance;   break;
+        case FilterType::Irradiance: _request.m_filterType = PipelineFilterType::Irradiance; break;
+        case FilterType::ShCoeffs:   _request.m_filterType = PipelineFilterType::ShCoeffs;   break;
+        case FilterType::None:
+        default:
+            _request.m_filterType = PipelineFilterType::None;
+            break;
+    }
+
+    _request.m_srcFaceSize   = _inputParameters.m_srcFaceSize;
+    _request.m_excludeBase   = _inputParameters.m_excludeBase;
+    _request.m_mipCount      = _inputParameters.m_mipCount;
+    _request.m_glossScale    = _inputParameters.m_glossScale;
+    _request.m_glossBias     = _inputParameters.m_glossBias;
+    _request.m_dstFaceSize   = _inputParameters.m_dstFaceSize;
+    _request.m_lightingModel = (LightingModel::Enum)_inputParameters.m_lightingModel;
+    _request.m_edgeFixup     = (EdgeFixup::Enum)_inputParameters.m_edgeFixup;
+
+    // Processing devices.
+    _request.m_numCpuProcessingThreads = _inputParameters.m_numCpuProcessingThreads;
+    _request.m_useOpenCL               = _inputParameters.m_useOpenCL;
+    _request.m_clVendor                = _inputParameters.m_clVendor;
+    _request.m_vendorStrPart           = ('\0' == _inputParameters.m_vendorStrPart[0])
+                                       ? NULL
+                                       : _inputParameters.m_vendorStrPart
+                                       ;
+    _request.m_deviceType              = _inputParameters.m_deviceType;
+    _request.m_deviceIndex             = _inputParameters.m_deviceIndex;
+
+    // Output.
+    const uint32_t outputNum = CMFT_MIN(_inputParameters.m_outputFilesNum, uint32_t(CMFT_PIPELINE_MAX_OUTPUTS));
+    _request.m_outputFilesNum = outputNum;
+    for (uint32_t outputIdx = 0; outputIdx < outputNum; ++outputIdx)
+    {
+        const OutputFile& output = _inputParameters.m_outputFiles[outputIdx];
+
+        _request.m_outputFiles[outputIdx].m_fileType      = (ImageFileType::Enum)output.m_fileType;
+        _request.m_outputFiles[outputIdx].m_textureFormat = (TextureFormat::Enum)output.m_textureFormat;
+        _request.m_outputFiles[outputIdx].m_outputType    = (OutputType::Enum)output.m_outputType;
+        _request.m_outputFiles[outputIdx].m_fileName      = output.m_fileName;
+    }
+
+    // Misc.
+    _request.m_silent = _inputParameters.m_silent;
+
+    // Encode.
+    _request.m_encodeRGBM = _inputParameters.m_encodeRGBM;
+}
+
 /// Outputs C file.
 void outputShCoeffs(const char* _pathName, double _shCoeffs[SH_COEFF_NUM][3])
 {
@@ -878,239 +957,11 @@ int cmftMain(int _argc, char const* const* _argv)
         return EXIT_FAILURE;
     }
 
-    if (inputParameters.m_silent)
-    {
-        setWarningPrintf(NULL);
-        setInfoPrintf(NULL);
-    }
+    PipelineRequest request;
+    pipelineRequestFromInputParameters(request, inputParameters);
 
-    Image image;
-    Image imageFaceList[6];
-
-    bool imageLoaded = false;
-
-    // Load image.
-    if (0 != strcmp("", inputParameters.m_inputFilePath))
-    {
-       imageLoaded = imageLoad   (image, inputParameters.m_inputFilePath, TextureFormat::RGBA32F)
-                  || imageLoadStb(image, inputParameters.m_inputFilePath, TextureFormat::RGBA32F)
-                   ;
-    }
-    else
-    {
-        if (0 != strcmp("", inputParameters.m_inputPosXFace)
-        &&  0 != strcmp("", inputParameters.m_inputNegXFace)
-        &&  0 != strcmp("", inputParameters.m_inputPosYFace)
-        &&  0 != strcmp("", inputParameters.m_inputNegYFace)
-        &&  0 != strcmp("", inputParameters.m_inputPosZFace)
-        &&  0 != strcmp("", inputParameters.m_inputNegZFace))
-        {
-            imageLoaded = imageLoad(imageFaceList[0], inputParameters.m_inputPosXFace, TextureFormat::RGBA32F)
-                       && imageLoad(imageFaceList[1], inputParameters.m_inputNegXFace, TextureFormat::RGBA32F)
-                       && imageLoad(imageFaceList[2], inputParameters.m_inputPosYFace, TextureFormat::RGBA32F)
-                       && imageLoad(imageFaceList[3], inputParameters.m_inputNegYFace, TextureFormat::RGBA32F)
-                       && imageLoad(imageFaceList[4], inputParameters.m_inputPosZFace, TextureFormat::RGBA32F)
-                       && imageLoad(imageFaceList[5], inputParameters.m_inputNegZFace, TextureFormat::RGBA32F)
-                       ;
-
-            if (imageLoaded)
-            {
-                INFO("Assembling cubemap from image list.");
-                imageCubemapFromFaceList(image, imageFaceList);
-            }
-
-            for (uint8_t ii = 0; ii < 6; ++ii)
-            {
-                imageUnload(imageFaceList[ii]);
-            }
-        }
-    }
-
-    if (!imageLoaded)
-    {
-        WARN("Invalid input!\n");
-        return EXIT_FAILURE;
-    }
-
-    // Assemble cubemap.
-    if (!imageIsCubemap(image))
-    {
-        if (imageIsCubeCross(image))
-        {
-            INFO("Converting cube cross to cubemap.");
-            imageCubemapFromCross(image);
-        }
-        else if (imageIsLatLong(image))
-        {
-            INFO("Converting latlong image to cubemap.");
-            imageCubemapFromLatLong(image);
-        }
-        else if (imageIsHStrip(image))
-        {
-            INFO("Converting hstrip image to cubemap.");
-            imageCubemapFromStrip(image);
-        }
-        else if (imageIsVStrip(image))
-        {
-            INFO("Converting vstrip image to cubemap.");
-            imageCubemapFromStrip(image);
-        }
-        else if (imageIsOctant(image))
-        {
-            INFO("Converting octant image to cubemap.");
-            imageCubemapFromOctant(image);
-        }
-        else
-        {
-            INFO("Image is not cubemap(6 faces), cubecross(ratio 3:4 or 4:3), latlong(ratio 2:1), hstrip(ratio 6:1), vstrip(ration 1:6)");
-        }
-    }
-
-    if (!imageIsCubemap(image))
-    {
-        INFO("Conversion failed. Exiting...");
-        return EXIT_FAILURE;
-    }
-
-    // Resize if requested.
-    if (0 != inputParameters.m_srcFaceSize && image.m_width != inputParameters.m_srcFaceSize)
-    {
-        INFO("Resizing source image from %ux%u to %ux%u."
-            , image.m_width
-            , image.m_height
-            , inputParameters.m_srcFaceSize
-            , inputParameters.m_srcFaceSize
-            );
-        imageResize(image, inputParameters.m_srcFaceSize, inputParameters.m_srcFaceSize);
-    }
-
-    // Transform cubemap if requested.
-    imageTransform(image
-                 , IMAGE_FACE_POSITIVEX | inputParameters.m_imageOpPosX
-                 , IMAGE_FACE_NEGATIVEX | inputParameters.m_imageOpNegX
-                 , IMAGE_FACE_POSITIVEY | inputParameters.m_imageOpPosY
-                 , IMAGE_FACE_NEGATIVEY | inputParameters.m_imageOpNegY
-                 , IMAGE_FACE_POSITIVEZ | inputParameters.m_imageOpPosZ
-                 , IMAGE_FACE_NEGATIVEZ | inputParameters.m_imageOpNegZ
-                 );
-
-    // Apply gamma on input image.
-    imageApplyGamma(image, inputParameters.m_inputGammaPowNumerator / inputParameters.m_inputGammaPowDenominator);
-
-    // Filter cubemap.
-    if (FilterType::Radiance == inputParameters.m_filterType)
-    {
-        ClContext* clContext = NULL;
-
-        int32_t clLoaded = 0;
-        if (inputParameters.m_useOpenCL)
-        {
-            // Dynamically load opencl lib.
-            clLoaded = cmft::clLoad();
-            if (clLoaded)
-            {
-                clContext = clInit(inputParameters.m_clVendor
-                                 , inputParameters.m_deviceType
-                                 , inputParameters.m_deviceIndex
-                                 );
-            }
-        }
-
-        // Start filter.
-        imageRadianceFilter(image
-                          , inputParameters.m_dstFaceSize
-                          , (LightingModel::Enum)inputParameters.m_lightingModel
-                          , (bool)inputParameters.m_excludeBase
-                          , (uint8_t)inputParameters.m_mipCount
-                          , (uint8_t)inputParameters.m_glossScale
-                          , (uint8_t)inputParameters.m_glossBias
-                          , (EdgeFixup::Enum)inputParameters.m_edgeFixup
-                          , (int8_t)inputParameters.m_numCpuProcessingThreads
-                          , clContext
-                          );
-
-        clDestroy(clContext);
-
-        // Unload opencl lib.
-        if (clLoaded)
-        {
-            cmft::clUnload();
-        }
-    }
-    else if (FilterType::Irradiance == inputParameters.m_filterType)
-    {
-        imageIrradianceFilterSh(image, inputParameters.m_dstFaceSize);
-    }
-    else if (FilterType::ShCoeffs == inputParameters.m_filterType)
-    {
-        double shCoeffs[SH_COEFF_NUM][3];
-        imageShCoeffs(shCoeffs, image);
-
-        for (uint32_t ii = 0; ii < inputParameters.m_outputFilesNum; ++ii)
-        {
-            const char* fileName = inputParameters.m_outputFiles[ii].m_fileName;
-            INFO("Saving spherical harmonics coefficients to %s.c", fileName);
-            outputShCoeffs(fileName, shCoeffs);
-        }
-
-        INFO("Done.");
-        return EXIT_SUCCESS;
-    }
-    else if (FilterType::None == inputParameters.m_filterType)
-    {
-        if (0 != inputParameters.m_dstFaceSize && image.m_width != inputParameters.m_dstFaceSize)
-        {
-            INFO("Resizing destination image from %ux%u to %ux%u."
-                , image.m_width
-                , image.m_height
-                , inputParameters.m_dstFaceSize
-                , inputParameters.m_dstFaceSize
-                );
-            imageResize(image, inputParameters.m_dstFaceSize, inputParameters.m_dstFaceSize);
-        }
-    }
-
-    // Generate mip map chain if requested.
-    if (inputParameters.m_generateMipMapChain)
-    {
-        imageGenerateMipMapChain(image);
-    }
-
-    // Apply gamma on output image.
-    imageApplyGamma(image, inputParameters.m_outputGammaPowNumerator / inputParameters.m_outputGammaPowDenominator);
-
-    // Encode RGBM (using --rgbm arg)
-    if (inputParameters.m_encodeRGBM)
-    {
-        INFO("Encoding RGBM");
-        imageEncodeRGBM(image);
-    }
-
-    // Save output images.
-    for (uint32_t outputIdx = 0; outputIdx < inputParameters.m_outputFilesNum; ++outputIdx)
-    {
-        const OutputFile& output = inputParameters.m_outputFiles[outputIdx];
-
-        OutputType::Enum    ot = (   OutputType::Enum)output.m_outputType;
-        ImageFileType::Enum ft = (ImageFileType::Enum)output.m_fileType;
-        TextureFormat::Enum tf = (TextureFormat::Enum)output.m_textureFormat;
-
-        // Encode RGBM (using texture format)
-        if( tf == TextureFormat::RGBM )
-        {
-            INFO("Encoding RGBM");
-            imageEncodeRGBM(image);
-            tf = TextureFormat::BGRA8;	// Change file format to BGRA8 for saving
-        }
-
-        imageSave(image, output.m_fileName, ft, ot, tf, true);
-    }
-
-    // Cleanup.
-    imageUnload(image);
-
-    INFO("Done.");
-    return EXIT_SUCCESS;
+    PipelineResult result;
+    return pipelineRun(request, &result);
 }
 
 #endif //CMFT_CMFT_CLI_H_HEADER_GUARD
