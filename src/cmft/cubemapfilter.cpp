@@ -1174,6 +1174,8 @@ namespace cmft
             m_memOut          = NULL;
             m_prevDstFaceSize = 0;
             m_srcFaceSize     = 0.0f;
+            m_computeFilterAreaOnCpu = (CMFT_COMPUTE_FILTER_AREA_ON_CPU != 0);
+            m_asyncReadback = false;
             m_memFaceData[0]  = NULL;
             m_memFaceData[1]  = NULL;
             m_memFaceData[2]  = NULL;
@@ -1193,6 +1195,25 @@ namespace cmft
             m_clContext = _clContext;
         }
 
+        void setComputeFilterAreaOnCpu(bool _enabled)
+        {
+            m_computeFilterAreaOnCpu = _enabled;
+        }
+
+        void setAsyncReadback(bool _enabled)
+        {
+            m_asyncReadback = _enabled;
+        }
+
+        void setEvent(cl_event _event)
+        {
+            if (NULL != m_event)
+            {
+                clReleaseEvent(m_event);
+            }
+            m_event = _event;
+        }
+
         bool hasValidDeviceContext() const
         {
             return (NULL != m_clContext && NULL != m_clContext->m_context);
@@ -1209,6 +1230,12 @@ namespace cmft
             {
                 clReleaseProgram(m_program);
                 m_program = NULL;
+            }
+
+            if (NULL != m_event)
+            {
+                clReleaseEvent(m_event);
+                m_event = NULL;
             }
         }
 
@@ -1389,6 +1416,7 @@ namespace cmft
 
             const float warp = warpFixupFactor(float(int32_t(_dstFaceSize)));
             const size_t bytesPerPixel = 4 /*numChannels*/ * 4 /*bytesPerChannel*/;
+            const size_t localWorkSize[2] = { 8, 8 };
 
             // Create output image.
             if (m_prevDstFaceSize != _dstFaceSize)
@@ -1411,22 +1439,25 @@ namespace cmft
             }
             m_prevDstFaceSize = _dstFaceSize;
 
-            #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            cl_mem area = NULL;
+            if (m_computeFilterAreaOnCpu)
+            {
                 // Build filter area info.
                 float* filterArea = buildCubemapFilterArea(_faceIdx, _dstFaceSize, _filterSize, _edgeFixup, &g_crtAllocator);
                 const size_t width = _dstFaceSize*6;
                 const size_t height = _dstFaceSize;
-                cl_mem area = clCreateImage2D(m_clContext->m_context
-                                            , CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR
-                                            , &sc_imageFormat
-                                            , width
-                                            , height
-                                            , width*bytesPerPixel
-                                            , filterArea
-                                            , &err
-                                            );
+                area = clCreateImage2D(m_clContext->m_context
+                                     , CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR
+                                     , &sc_imageFormat
+                                     , width
+                                     , height
+                                     , width*bytesPerPixel
+                                     , filterArea
+                                     , &err
+                                     );
                 CL_CHECK_RETURN(err);
-            #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+                CMFT_FREE(&g_crtAllocator, filterArea);
+            }
             CMFT_UNUSED(_edgeFixup);
 
             // Set arguments.
@@ -1450,9 +1481,10 @@ namespace cmft
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter, 17, sizeof(cl_mem),  (const void*)&m_memNormalSolidAngle[3]));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter, 18, sizeof(cl_mem),  (const void*)&m_memNormalSolidAngle[4]));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter, 19, sizeof(cl_mem),  (const void*)&m_memNormalSolidAngle[5]));
-            #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            if (m_computeFilterAreaOnCpu)
+            {
                 CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter, 20, sizeof(cl_mem),  (const void*)&area));
-            #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            }
 
             // Process in tiles of 64x64.
             const uint32_t tileSize = 64;
@@ -1467,24 +1499,26 @@ namespace cmft
                         CMFT_MIN(tileSize, _dstFaceSize-workOffset[0]),
                         CMFT_MIN(tileSize, _dstFaceSize-workOffset[1]),
                     };
+                    const size_t* local = (tileSize == workSize[0] && tileSize == workSize[1]) ? localWorkSize : NULL;
                     CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
                                                               , m_radFilter
                                                               , 2
                                                               , workOffset
                                                               , workSize
-                                                              , NULL
+                                                              , local
                                                               , 0
                                                               , NULL
-                                                              , &m_event
+                                                              , NULL
                                                               ));
                 }
             }
 
             const size_t origin[3] = { 0, 0, 0 };
             const size_t region[3] = { _dstFaceSize, _dstFaceSize, 1 };
+            cl_event readEvent = NULL;
             CL_CHECK_EXPR_RETURN(clEnqueueReadImage(m_clContext->m_commandQueue
                                                   , m_memOut
-                                                  , CL_TRUE
+                                                  , CL_FALSE
                                                   , origin
                                                   , region
                                                   , _dstFaceSize*bytesPerPixel
@@ -1492,13 +1526,24 @@ namespace cmft
                                                   , _out
                                                   , 0
                                                   , NULL
-                                                  , &m_event
+                                                  , &readEvent
                                                   ));
 
-            #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            if (m_asyncReadback)
+            {
+                CL_CHECK_EXPR_RETURN(clFlush(m_clContext->m_commandQueue));
+                setEvent(readEvent);
+            }
+            else
+            {
+                CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &readEvent));
+                setEvent(readEvent);
+            }
+
+            if (m_computeFilterAreaOnCpu)
+            {
                 clReleaseMemObject(area);
-                CMFT_FREE(g_allocator, filterArea);
-            #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            }
 
             return true;
         }
@@ -1518,23 +1563,27 @@ namespace cmft
             const float warp = warpFixupFactor(float(int32_t(_dstFaceSize)));
             const size_t workSize[2] = { _dstFaceSize, _dstFaceSize };
             const size_t bytesPerPixel = 4 /*numChannels*/ * 4 /*bytesPerChannel*/;
+            const size_t localWorkSize[2] = { 8, 8 };
 
-            #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            cl_mem area = NULL;
+            if (m_computeFilterAreaOnCpu)
+            {
                 // Build filter area info.
                 float* filterArea = buildCubemapFilterArea(_faceIdx, _dstFaceSize, _filterSize, _edgeFixup, &g_crtAllocator);
                 const size_t width = _dstFaceSize*6;
                 const size_t height = _dstFaceSize;
-                cl_mem area = clCreateImage2D(m_clContext->m_context
-                                            , CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR
-                                            , &sc_imageFormat
-                                            , width
-                                            , height
-                                            , width*bytesPerPixel
-                                            , filterArea
-                                            , &err
-                                            );
+                area = clCreateImage2D(m_clContext->m_context
+                                     , CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR
+                                     , &sc_imageFormat
+                                     , width
+                                     , height
+                                     , width*bytesPerPixel
+                                     , filterArea
+                                     , &err
+                                     );
                 CL_CHECK_RETURN(err);
-            #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+                CMFT_FREE(&g_crtAllocator, filterArea);
+            }
             CMFT_UNUSED(_edgeFixup);
 
             // Set arguments that do not change for the entire task.
@@ -1545,9 +1594,10 @@ namespace cmft
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilterSingle,  8, sizeof(float),   (const void*)&warp));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilterSingle,  9, sizeof(int8_t),  (const void*)&_faceIdx));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilterSingle, 10, sizeof(float),   (const void*)&m_srcFaceSize));
-            #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
-            CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilterSingle, 11, sizeof(cl_mem),  (const void*)&area));
-            #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            if (m_computeFilterAreaOnCpu)
+            {
+                CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilterSingle, 11, sizeof(cl_mem),  (const void*)&area));
+            }
 
             // Process each face separately in tiles of 64x64.
             const uint32_t tileSize = 64;
@@ -1582,15 +1632,16 @@ namespace cmft
                             CMFT_MIN(tileSize, _dstFaceSize-tileWorkOffset[0]),
                             CMFT_MIN(tileSize, _dstFaceSize-tileWorkOffset[1]),
                         };
+                        const size_t* local = (tileSize == tileWorkSize[0] && tileSize == tileWorkSize[1]) ? localWorkSize : NULL;
                         CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
                                                                   , m_radFilterSingle
                                                                   , 2
                                                                   , tileWorkOffset
                                                                   , tileWorkSize
-                                                                  , NULL
+                                                                  , local
                                                                   , 0
                                                                   , NULL
-                                                                  , &m_event
+                                                                  , NULL
                                                                   ));
                     }
                 }
@@ -1624,14 +1675,26 @@ namespace cmft
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 4, sizeof(cl_mem), (const void*)&faces[3]));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 5, sizeof(cl_mem), (const void*)&faces[4]));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 6, sizeof(cl_mem), (const void*)&faces[5]));
-            CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue, m_sum, 2, NULL, workSize, NULL, 0, NULL, &m_event));
+
+            const size_t* localSum = (0 == (_dstFaceSize & 7)) ? localWorkSize : NULL;
+            CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
+                                                      , m_sum
+                                                      , 2
+                                                      , NULL
+                                                      , workSize
+                                                      , localSum
+                                                      , 0
+                                                      , NULL
+                                                      , NULL
+                                                      ));
 
             // Read result.
             const size_t origin[3] = { 0, 0, 0 };
             const size_t region[3] = { _dstFaceSize, _dstFaceSize, 1 };
+            cl_event readEvent = NULL;
             CL_CHECK_EXPR_RETURN(clEnqueueReadImage(m_clContext->m_commandQueue
                                                   , m_memOut
-                                                  , CL_TRUE
+                                                  , CL_FALSE
                                                   , origin
                                                   , region
                                                   , _dstFaceSize*bytesPerPixel
@@ -1639,13 +1702,29 @@ namespace cmft
                                                   , _out
                                                   , 0
                                                   , NULL
-                                                  , &m_event
+                                                  , &readEvent
                                                   ));
 
-            #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            if (m_asyncReadback)
+            {
+                CL_CHECK_EXPR_RETURN(clFlush(m_clContext->m_commandQueue));
+                setEvent(readEvent);
+            }
+            else
+            {
+                CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &readEvent));
+                setEvent(readEvent);
+            }
+
+            if (m_computeFilterAreaOnCpu)
+            {
                 clReleaseMemObject(area);
-                CMFT_FREE(&g_crtAllocator, filterArea);
-            #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+            }
+
+            for (uint8_t ii = 0; ii < 6; ++ii)
+            {
+                clReleaseMemObject(faces[ii]);
+            }
 
             return true;
         }
@@ -1655,25 +1734,26 @@ namespace cmft
 
         bool run(void* _out, uint8_t _faceIdx, uint32_t _dstFaceSize, float _specularPower, float _specularAngle, float _filterSize, EdgeFixup::Enum _edgeFixup = EdgeFixup::None)
         {
-            /// if (m_srcFaceSize > 512)
-            /// {
-            ///     // Prevents driver crash by running 6+1 smaller kernels instead of a big one.
-            ///     return processFaceByFaceAndSum(_out, _faceIdx, _dstFaceSize, _specularPower, _specularAngle, _filterSize, _edgeFixup);
-            /// }
-            /// else
-            /// {
-            ///     return processAllAtOnce(_out, _faceIdx, _dstFaceSize, _specularPower, _specularAngle, _filterSize, _edgeFixup);
-            /// }
+            if (m_srcFaceSize > 512.0f)
+            {
+                // Prevent potential driver issues by using smaller kernels for large source cubemaps.
+                return processFaceByFaceAndSum(_out, _faceIdx, _dstFaceSize, _specularPower, _specularAngle, _filterSize, _edgeFixup);
+            }
 
-            return processFaceByFaceAndSum(_out, _faceIdx, _dstFaceSize, _specularPower, _specularAngle, _filterSize, _edgeFixup);
+            return processAllAtOnce(_out, _faceIdx, _dstFaceSize, _specularPower, _specularAngle, _filterSize, _edgeFixup);
         }
 
         bool isIdle() const
         {
+            if (NULL == m_event)
+            {
+                return true;
+            }
+
             cl_int status;
             clGetEventInfo(m_event, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(cl_int), (void*)&status, NULL);
 
-            return ((CL_COMPLETE == status) || (NULL == m_event));
+            return (CL_COMPLETE == status);
         }
 
         void finish() const
@@ -1708,6 +1788,12 @@ namespace cmft
             RELEASE_CL_KERNEL(m_radFilter);
             RELEASE_CL_KERNEL(m_radFilterSingle);
             RELEASE_CL_KERNEL(m_sum);
+
+            if (NULL != m_event)
+            {
+                clReleaseEvent(m_event);
+                m_event = NULL;
+            }
         #undef RELEASE_CL_KERNEL
         #undef RELEASE_CL_PROG
         }
@@ -1721,6 +1807,8 @@ namespace cmft
         cl_mem m_memOut;
         uint32_t m_prevDstFaceSize;
         float m_srcFaceSize;
+        bool m_computeFilterAreaOnCpu;
+        bool m_asyncReadback;
         cl_mem m_memFaceData[6];
         cl_mem m_memNormalSolidAngle[6];
     };
@@ -1914,32 +2002,40 @@ namespace cmft
         const uint32_t maxActiveCpuThreads = (uint32_t)CMFT_CLAMP(_numCpuProcessingThreads, 0, 64);
 
         // Prepare OpenCL kernel and device memory.
+        const bool forceGpuFilterArea = (RadianceFilterProcessing::GpuOnly == _processingMode);
+        const bool computeFilterAreaOnCpu = forceGpuFilterArea
+                                          ? false
+                                          : (CMFT_COMPUTE_FILTER_AREA_ON_CPU != 0)
+                                          ;
 
+        s_radianceProgram.setComputeFilterAreaOnCpu(computeFilterAreaOnCpu);
+        s_radianceProgram.setAsyncReadback(RadianceFilterProcessing::GpuOnly == _processingMode);
         s_radianceProgram.setDeviceContext(_clContext);
         if (s_radianceProgram.hasValidDeviceContext())
         {
+            const char* header = NULL;
+            size_t headerSize = 0;
+
             if (EdgeFixup::Warp == _edgeFixup)
             {
-                #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
-                    const char header[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 1\n"
-                                          "#define WARP_FIXUP\n";
-                #else
-                    const char header[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 0\n"
-                                          "#define WARP_FIXUP\n";
-                #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+                static const char headerCpuArea[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 1\n"
+                                                    "#define WARP_FIXUP\n";
+                static const char headerGpuArea[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 0\n"
+                                                    "#define WARP_FIXUP\n";
+                header = computeFilterAreaOnCpu ? headerCpuArea : headerGpuArea;
+                headerSize = strlen(header) + 1;
 
-                s_radianceProgram.createFromStr((const char*)sc_radianceSource, sizeof(sc_radianceSource), header, sizeof(header));
+                s_radianceProgram.createFromStr((const char*)sc_radianceSource, sizeof(sc_radianceSource), header, headerSize);
                 //s_radianceProgram.createFromFile("radiance.cl", header, sizeof(header));
             }
             else
             {
-                #if CMFT_COMPUTE_FILTER_AREA_ON_CPU
-                    const char header[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 1\n";
-                #else
-                    const char header[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 0\n";
-                #endif //CMFT_COMPUTE_FILTER_AREA_ON_CPU
+                static const char headerCpuArea[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 1\n";
+                static const char headerGpuArea[] = "#define CMFT_COMPUTE_FILTER_AREA_ON_CPU 0\n";
+                header = computeFilterAreaOnCpu ? headerCpuArea : headerGpuArea;
+                headerSize = strlen(header) + 1;
 
-                s_radianceProgram.createFromStr((const char*)sc_radianceSource, sizeof(sc_radianceSource), header, sizeof(header));
+                s_radianceProgram.createFromStr((const char*)sc_radianceSource, sizeof(sc_radianceSource), header, headerSize);
                 //s_radianceProgram.createFromFile("radiance.cl", header, sizeof(header));
             }
         }
@@ -2272,6 +2368,11 @@ namespace cmft
                     for (uint32_t ii = 0; ii < activeCpuThreads; ++ii)
                     {
                         cpuThreads[ii].join();
+                    }
+
+                    if (gpuReady)
+                    {
+                        s_radianceProgram.finish();
                     }
 
                     // Process unfinished tasks on CPU.
