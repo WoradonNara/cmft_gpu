@@ -1171,6 +1171,7 @@ namespace cmft
             m_radFilterSingle = NULL;
             m_sum             = NULL;
             m_event           = NULL;
+            m_transferQueue   = NULL;
             m_memOut          = NULL;
             m_prevDstFaceSize = 0;
             m_srcFaceSize     = 0.0f;
@@ -1192,6 +1193,12 @@ namespace cmft
 
         void setDeviceContext(const ClContext* _clContext)
         {
+            if (_clContext != m_clContext && NULL != m_transferQueue)
+            {
+                clReleaseCommandQueue(m_transferQueue);
+                m_transferQueue = NULL;
+            }
+
             m_clContext = _clContext;
         }
 
@@ -1236,6 +1243,12 @@ namespace cmft
             {
                 clReleaseEvent(m_event);
                 m_event = NULL;
+            }
+
+            if (NULL != m_transferQueue)
+            {
+                clReleaseCommandQueue(m_transferQueue);
+                m_transferQueue = NULL;
             }
         }
 
@@ -1399,6 +1412,24 @@ namespace cmft
 
             m_srcFaceSize = float(int32_t(_image.m_width));
 
+            if (m_asyncReadback)
+            {
+                if (NULL == m_transferQueue)
+                {
+                    m_transferQueue = clCreateCommandQueue(m_clContext->m_context
+                                                         , m_clContext->m_device
+                                                         , 0
+                                                         , &err
+                                                         );
+                    CL_CHECK_RETURN(err);
+                }
+            }
+            else if (NULL != m_transferQueue)
+            {
+                clReleaseCommandQueue(m_transferQueue);
+                m_transferQueue = NULL;
+            }
+
             return true;
         }
 
@@ -1489,6 +1520,7 @@ namespace cmft
             // Process in tiles of 64x64.
             const uint32_t tileSize = 64;
             const uint32_t count = ((_dstFaceSize-1)/tileSize)+1;
+            cl_event kernelEvent = NULL;
             for (uint32_t yy = 0; yy < count; ++yy)
             {
                 for (uint32_t xx = 0; xx < count; ++xx)
@@ -1499,6 +1531,7 @@ namespace cmft
                         CMFT_MIN(tileSize, _dstFaceSize-workOffset[0]),
                         CMFT_MIN(tileSize, _dstFaceSize-workOffset[1]),
                     };
+                    const bool isLastTile = (yy == (count-1) && xx == (count-1));
                     const size_t* local = (tileSize == workSize[0] && tileSize == workSize[1]) ? localWorkSize : NULL;
                     CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
                                                               , m_radFilter
@@ -1508,7 +1541,7 @@ namespace cmft
                                                               , local
                                                               , 0
                                                               , NULL
-                                                              , NULL
+                                                              , isLastTile ? &kernelEvent : NULL
                                                               ));
                 }
             }
@@ -1516,7 +1549,13 @@ namespace cmft
             const size_t origin[3] = { 0, 0, 0 };
             const size_t region[3] = { _dstFaceSize, _dstFaceSize, 1 };
             cl_event readEvent = NULL;
-            CL_CHECK_EXPR_RETURN(clEnqueueReadImage(m_clContext->m_commandQueue
+            const cl_command_queue readQueue = (m_asyncReadback && NULL != m_transferQueue)
+                                             ? m_transferQueue
+                                             : m_clContext->m_commandQueue
+                                             ;
+            const cl_uint waitCount = (readQueue == m_transferQueue && NULL != kernelEvent) ? 1 : 0;
+            const cl_event* waitEvents = (0 == waitCount) ? NULL : &kernelEvent;
+            CL_CHECK_EXPR_RETURN(clEnqueueReadImage(readQueue
                                                   , m_memOut
                                                   , CL_FALSE
                                                   , origin
@@ -1524,14 +1563,20 @@ namespace cmft
                                                   , _dstFaceSize*bytesPerPixel
                                                   , 0
                                                   , _out
-                                                  , 0
-                                                  , NULL
+                                                  , waitCount
+                                                  , waitEvents
                                                   , &readEvent
                                                   ));
+
+            if (NULL != kernelEvent)
+            {
+                clReleaseEvent(kernelEvent);
+            }
 
             if (m_asyncReadback)
             {
                 CL_CHECK_EXPR_RETURN(clFlush(m_clContext->m_commandQueue));
+                CL_CHECK_EXPR_RETURN(clFlush(readQueue));
                 setEvent(readEvent);
             }
             else
@@ -1677,6 +1722,7 @@ namespace cmft
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 6, sizeof(cl_mem), (const void*)&faces[5]));
 
             const size_t* localSum = (0 == (_dstFaceSize & 7)) ? localWorkSize : NULL;
+            cl_event sumEvent = NULL;
             CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
                                                       , m_sum
                                                       , 2
@@ -1685,14 +1731,20 @@ namespace cmft
                                                       , localSum
                                                       , 0
                                                       , NULL
-                                                      , NULL
+                                                      , &sumEvent
                                                       ));
 
             // Read result.
             const size_t origin[3] = { 0, 0, 0 };
             const size_t region[3] = { _dstFaceSize, _dstFaceSize, 1 };
             cl_event readEvent = NULL;
-            CL_CHECK_EXPR_RETURN(clEnqueueReadImage(m_clContext->m_commandQueue
+            const cl_command_queue readQueue = (m_asyncReadback && NULL != m_transferQueue)
+                                             ? m_transferQueue
+                                             : m_clContext->m_commandQueue
+                                             ;
+            const cl_uint waitCount = (readQueue == m_transferQueue && NULL != sumEvent) ? 1 : 0;
+            const cl_event* waitEvents = (0 == waitCount) ? NULL : &sumEvent;
+            CL_CHECK_EXPR_RETURN(clEnqueueReadImage(readQueue
                                                   , m_memOut
                                                   , CL_FALSE
                                                   , origin
@@ -1700,14 +1752,20 @@ namespace cmft
                                                   , _dstFaceSize*bytesPerPixel
                                                   , 0
                                                   , _out
-                                                  , 0
-                                                  , NULL
+                                                  , waitCount
+                                                  , waitEvents
                                                   , &readEvent
                                                   ));
+
+            if (NULL != sumEvent)
+            {
+                clReleaseEvent(sumEvent);
+            }
 
             if (m_asyncReadback)
             {
                 CL_CHECK_EXPR_RETURN(clFlush(m_clContext->m_commandQueue));
+                CL_CHECK_EXPR_RETURN(clFlush(readQueue));
                 setEvent(readEvent);
             }
             else
@@ -1759,6 +1817,10 @@ namespace cmft
         void finish() const
         {
             CL_CHECK(clFinish(m_clContext->m_commandQueue));
+            if (NULL != m_transferQueue)
+            {
+                CL_CHECK(clFinish(m_transferQueue));
+            }
         }
 
         void releaseDeviceMemory()
@@ -1794,6 +1856,12 @@ namespace cmft
                 clReleaseEvent(m_event);
                 m_event = NULL;
             }
+
+            if (NULL != m_transferQueue)
+            {
+                clReleaseCommandQueue(m_transferQueue);
+                m_transferQueue = NULL;
+            }
         #undef RELEASE_CL_KERNEL
         #undef RELEASE_CL_PROG
         }
@@ -1804,6 +1872,7 @@ namespace cmft
         cl_kernel m_radFilterSingle;
         cl_kernel m_sum;
         cl_event m_event;
+        cl_command_queue m_transferQueue;
         cl_mem m_memOut;
         uint32_t m_prevDstFaceSize;
         float m_srcFaceSize;
