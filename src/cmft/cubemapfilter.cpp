@@ -1038,12 +1038,17 @@ namespace cmft
             memcpy(&m_params[_mip][_face], _params, sizeof(RadianceFilterParams));
         }
 
-        // Returns cube face radiance filter parameters starting from the top mip level.
-        const RadianceFilterParams* getFromTop()
+        uint8_t getFromTopBatch(const RadianceFilterParams** _batch, uint8_t _capacity)
         {
+            if (0 == _capacity)
+            {
+                return 0;
+            }
+
             std::lock_guard<std::mutex> lock(m_access);
 
-            while (m_mipStart <= m_mipEnd)
+            uint8_t count = 0;
+            while (count < _capacity && m_mipStart <= m_mipEnd)
             {
                 if (m_mipFace[m_mipStart] >= 6)
                 {
@@ -1052,12 +1057,11 @@ namespace cmft
                 else
                 {
                     const uint8_t face = m_mipFace[m_mipStart]++;
-                    return &m_params[m_mipStart][face];
+                    _batch[count++] = &m_params[m_mipStart][face];
                 }
-
             }
 
-            return NULL;
+            return count;
         }
 
         // Returns cube face radiance filter parameters starting from the bottom mip level.
@@ -1163,6 +1167,8 @@ namespace cmft
 
     struct RadianceProgram
     {
+        enum { MaxInFlightGpuTasks = 2 };
+
         RadianceProgram()
         {
             m_clContext       = NULL;
@@ -1172,10 +1178,12 @@ namespace cmft
             m_sum             = NULL;
             m_event           = NULL;
             m_transferQueue   = NULL;
-            m_memOut[0]       = NULL;
-            m_memOut[1]       = NULL;
-            m_memOutReadEvent[0] = NULL;
-            m_memOutReadEvent[1] = NULL;
+            for (uint8_t ii = 0; ii < MaxInFlightGpuTasks; ++ii)
+            {
+                m_memOut[ii] = NULL;
+                m_memOutReadEvent[ii] = NULL;
+            }
+            m_inFlightGpuTasks = 2;
             m_memOutWriteIdx  = 0;
             m_prevDstFaceSize = 0;
             m_srcFaceSize     = 0.0f;
@@ -1226,6 +1234,55 @@ namespace cmft
                 clReleaseEvent(m_event);
             }
             m_event = _event;
+        }
+
+        void setInFlightGpuTaskCount(uint8_t _inFlightGpuTasks)
+        {
+            if (0 == _inFlightGpuTasks)
+            {
+                m_inFlightGpuTasks = MaxInFlightGpuTasks;
+                return;
+            }
+
+            if (_inFlightGpuTasks > MaxInFlightGpuTasks)
+            {
+                INFO("Radiance -> Requested GPU in-flight task depth %u exceeds max %u; clamping.", _inFlightGpuTasks, MaxInFlightGpuTasks);
+            }
+
+            m_inFlightGpuTasks = (uint8_t)CMFT_CLAMP(_inFlightGpuTasks, 1, MaxInFlightGpuTasks);
+        }
+
+        uint8_t getInFlightGpuTaskCount() const
+        {
+            return m_inFlightGpuTasks;
+        }
+
+        bool acquireOutputSlot(uint8_t* _outIdx)
+        {
+            if (!m_asyncReadback)
+            {
+                *_outIdx = 0;
+                return true;
+            }
+
+            const uint8_t inFlightGpuTasks = getInFlightGpuTaskCount();
+            const uint8_t outIdx = uint8_t((m_memOutWriteIdx++) % inFlightGpuTasks);
+
+            if (NULL != m_memOutReadEvent[outIdx])
+            {
+                const cl_int waitResult = clWaitForEvents(1, &m_memOutReadEvent[outIdx]);
+                if (CL_SUCCESS != waitResult)
+                {
+                    WARN("OpenCL failed!");
+                    return false;
+                }
+
+                clReleaseEvent(m_memOutReadEvent[outIdx]);
+                m_memOutReadEvent[outIdx] = NULL;
+            }
+
+            *_outIdx = outIdx;
+            return true;
         }
 
         void updateLocalWorkSizeTuning()
@@ -1308,7 +1365,7 @@ namespace cmft
                 m_transferQueue = NULL;
             }
 
-            for (uint8_t ii = 0; ii < 2; ++ii)
+            for (uint8_t ii = 0; ii < MaxInFlightGpuTasks; ++ii)
             {
                 if (NULL != m_memOut[ii])
                 {
@@ -1524,7 +1581,7 @@ namespace cmft
             // Create output image.
             if (m_prevDstFaceSize != _dstFaceSize)
             {
-                for (uint8_t ii = 0; ii < 2; ++ii)
+                for (uint8_t ii = 0; ii < MaxInFlightGpuTasks; ++ii)
                 {
                     if (NULL != m_memOutReadEvent[ii])
                     {
@@ -1543,12 +1600,10 @@ namespace cmft
                 m_prevDstFaceSize = _dstFaceSize;
             }
 
-            const uint8_t outIdx = m_asyncReadback ? uint8_t(m_memOutWriteIdx++ & 1) : 0;
-            if (NULL != m_memOutReadEvent[outIdx])
+            uint8_t outIdx = 0;
+            if (!acquireOutputSlot(&outIdx))
             {
-                CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &m_memOutReadEvent[outIdx]));
-                clReleaseEvent(m_memOutReadEvent[outIdx]);
-                m_memOutReadEvent[outIdx] = NULL;
+                return false;
             }
 
             if (NULL == m_memOut[outIdx])
@@ -1801,7 +1856,7 @@ namespace cmft
             // Sum partial results.
             if (m_prevDstFaceSize != _dstFaceSize)
             {
-                for (uint8_t ii = 0; ii < 2; ++ii)
+                for (uint8_t ii = 0; ii < MaxInFlightGpuTasks; ++ii)
                 {
                     if (NULL != m_memOutReadEvent[ii])
                     {
@@ -1820,12 +1875,10 @@ namespace cmft
                 m_prevDstFaceSize = _dstFaceSize;
             }
 
-            const uint8_t outIdx = m_asyncReadback ? uint8_t(m_memOutWriteIdx++ & 1) : 0;
-            if (NULL != m_memOutReadEvent[outIdx])
+            uint8_t outIdx = 0;
+            if (!acquireOutputSlot(&outIdx))
             {
-                CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &m_memOutReadEvent[outIdx]));
-                clReleaseEvent(m_memOutReadEvent[outIdx]);
-                m_memOutReadEvent[outIdx] = NULL;
+                return false;
             }
 
             if (NULL == m_memOut[outIdx])
@@ -1963,8 +2016,10 @@ namespace cmft
         void releaseDeviceMemory()
         {
         #define RELEASE_CL_MEM(_mem) do { if (NULL != _mem) { clReleaseMemObject(_mem); _mem = NULL; } } while (0)
-            RELEASE_CL_MEM(m_memOut[0]);
-            RELEASE_CL_MEM(m_memOut[1]);
+            for (uint8_t ii = 0; ii < MaxInFlightGpuTasks; ++ii)
+            {
+                RELEASE_CL_MEM(m_memOut[ii]);
+            }
             RELEASE_CL_MEM(m_memFaceData[0]);
             RELEASE_CL_MEM(m_memFaceData[1]);
             RELEASE_CL_MEM(m_memFaceData[2]);
@@ -1978,16 +2033,13 @@ namespace cmft
             RELEASE_CL_MEM(m_memNormalSolidAngle[4]);
             RELEASE_CL_MEM(m_memNormalSolidAngle[5]);
 
-            if (NULL != m_memOutReadEvent[0])
+            for (uint8_t ii = 0; ii < MaxInFlightGpuTasks; ++ii)
             {
-                clReleaseEvent(m_memOutReadEvent[0]);
-                m_memOutReadEvent[0] = NULL;
-            }
-
-            if (NULL != m_memOutReadEvent[1])
-            {
-                clReleaseEvent(m_memOutReadEvent[1]);
-                m_memOutReadEvent[1] = NULL;
+                if (NULL != m_memOutReadEvent[ii])
+                {
+                    clReleaseEvent(m_memOutReadEvent[ii]);
+                    m_memOutReadEvent[ii] = NULL;
+                }
             }
 
             m_memOutWriteIdx = 0;
@@ -2015,7 +2067,7 @@ namespace cmft
                 m_transferQueue = NULL;
             }
 
-            for (uint8_t ii = 0; ii < 2; ++ii)
+            for (uint8_t ii = 0; ii < MaxInFlightGpuTasks; ++ii)
             {
                 if (NULL != m_memOut[ii])
                 {
@@ -2042,8 +2094,9 @@ namespace cmft
         cl_kernel m_sum;
         cl_event m_event;
         cl_command_queue m_transferQueue;
-        cl_mem m_memOut[2];
-        cl_event m_memOutReadEvent[2];
+        cl_mem m_memOut[MaxInFlightGpuTasks];
+        cl_event m_memOutReadEvent[MaxInFlightGpuTasks];
+        uint8_t m_inFlightGpuTasks;
         uint8_t m_memOutWriteIdx;
         uint32_t m_prevDstFaceSize;
         float m_srcFaceSize;
@@ -2054,6 +2107,11 @@ namespace cmft
         cl_mem m_memNormalSolidAngle[6];
     };
     RadianceProgram s_radianceProgram;
+
+    void imageRadianceSetGpuInFlightTasks(uint8_t _gpuInFlightTasks)
+    {
+        s_radianceProgram.setInFlightGpuTaskCount(_gpuInFlightTasks);
+    }
 
     int32_t radianceFilterGpu(void* _taskList)
     {
@@ -2068,42 +2126,57 @@ namespace cmft
         RadianceFilterTaskList* taskList = (RadianceFilterTaskList*)_taskList;
 
         // Gpu is processing from the top level mip map to the bottom.
-        const RadianceFilterParams* params;
-        while ((params = taskList->getFromTop()) != NULL)
+        const uint8_t batchCapacity = s_radianceProgram.getInFlightGpuTaskCount();
+        const RadianceFilterParams* batch[RadianceProgram::MaxInFlightGpuTasks] = { NULL };
+        for (;;)
         {
-            // Start timer.
-            const uint64_t startTime = cmft::getHPCounter();
-
-            // Run radiance program.
-            const bool result = s_radianceProgram.run(params->m_dstPtr
-                                                    , params->m_face
-                                                    , params->m_mipFaceSize
-                                                    , params->m_specularPower
-                                                    , params->m_specularAngle
-                                                    , params->m_filterSize
-                                                    , params->m_edgeFixup
-                                                    );
-            if (result)
+            const uint8_t taskCount = taskList->getFromTopBatch(batch, batchCapacity);
+            if (0 == taskCount)
             {
-                // Determine task duration.
-                const uint64_t currentTime = cmft::getHPCounter();
-                const uint64_t taskDuration = currentTime - startTime;
-                const uint64_t totalDuration = currentTime - s_globalState.m_startTime;
-
-                // Output process info.
-                INFO("Radiance ->  <GPU>  | %4u | %7.3fs | %7.3fs"
-                     , params->m_mipFaceSize
-                     , double(taskDuration)*toSec
-                     , double(totalDuration)*toSec
-                    );
-
-                // Update task counter.
-                s_globalState.incrCompletedTasksGpu();
+                break;
             }
-            else
+
+            for (uint8_t taskIdx = 0; taskIdx < taskCount; ++taskIdx)
             {
-                taskList->pushUnfinished(params);
-                return EXIT_FAILURE;
+                const RadianceFilterParams* params = batch[taskIdx];
+
+                // Start timer.
+                const uint64_t startTime = cmft::getHPCounter();
+
+                // Run radiance program.
+                const bool result = s_radianceProgram.run(params->m_dstPtr
+                                                        , params->m_face
+                                                        , params->m_mipFaceSize
+                                                        , params->m_specularPower
+                                                        , params->m_specularAngle
+                                                        , params->m_filterSize
+                                                        , params->m_edgeFixup
+                                                        );
+                if (result)
+                {
+                    // Determine task duration.
+                    const uint64_t currentTime = cmft::getHPCounter();
+                    const uint64_t taskDuration = currentTime - startTime;
+                    const uint64_t totalDuration = currentTime - s_globalState.m_startTime;
+
+                    // Output process info.
+                    INFO("Radiance ->  <GPU>  | %4u | %7.3fs | %7.3fs"
+                         , params->m_mipFaceSize
+                         , double(taskDuration)*toSec
+                         , double(totalDuration)*toSec
+                        );
+
+                    // Update task counter.
+                    s_globalState.incrCompletedTasksGpu();
+                }
+                else
+                {
+                    for (uint8_t requeue = taskIdx; requeue < taskCount; ++requeue)
+                    {
+                        taskList->pushUnfinished(batch[requeue]);
+                    }
+                    return EXIT_FAILURE;
+                }
             }
         }
 
@@ -2525,6 +2598,11 @@ namespace cmft
                     , !gpuReady?"":" and "
                     , !gpuReady?"":s_radianceProgram.m_clContext->m_deviceName
                     );
+
+                if (gpuReady)
+                {
+                    INFO("Radiance -> GPU in-flight task depth: %u", s_radianceProgram.getInFlightGpuTaskCount());
+                }
 
                 // Alloc data for tasks parameters.
                 const uint8_t mipStart = uint8_t(_excludeBase);

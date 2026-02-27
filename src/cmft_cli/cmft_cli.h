@@ -229,6 +229,7 @@ struct InputParameters
 
     // Processing devices.
     uint32_t m_numCpuProcessingThreads;
+    uint32_t m_gpuInFlightTasks;
     uint32_t m_processingMode;
     bool m_useOpenCL;
     uint32_t m_clVendor;
@@ -336,6 +337,7 @@ void inputParametersFromCommandLine(InputParameters& _inputParameters, const cmf
 
     // Processing devices.
     _cmdLine.hasArg(_inputParameters.m_numCpuProcessingThreads, '\0', "numCpuProcessingThreads");
+    _cmdLine.hasArg(_inputParameters.m_gpuInFlightTasks, '\0', "gpuInFlightTasks");
     valueFromOptionMap(_inputParameters.m_processingMode, s_processingMode, _cmdLine.findOption("processingMode"));
     _cmdLine.hasArg(_inputParameters.m_useOpenCL, '\0', "useOpenCL");
 
@@ -548,6 +550,7 @@ void inputParametersDefault(InputParameters& _inputParameters)
 
     // Processing devices.
     _inputParameters.m_numCpuProcessingThreads = UINT32_MAX;
+    _inputParameters.m_gpuInFlightTasks        = 0;
     _inputParameters.m_processingMode          = RadianceFilterProcessing::Auto;
     _inputParameters.m_useOpenCL               = true;
     _inputParameters.m_deviceIndex             = 0;
@@ -610,6 +613,7 @@ void pipelineRequestFromInputParameters(PipelineRequest& _request, const InputPa
 
     // Processing devices.
     _request.m_numCpuProcessingThreads = _inputParameters.m_numCpuProcessingThreads;
+    _request.m_gpuInFlightTasks        = _inputParameters.m_gpuInFlightTasks;
     _request.m_useOpenCL               = _inputParameters.m_useOpenCL;
     _request.m_clVendor                = _inputParameters.m_clVendor;
     _request.m_vendorStrPart           = ('\0' == _inputParameters.m_vendorStrPart[0])
@@ -775,6 +779,7 @@ void printHelp()
             "         --clVendor anyGpuVendor\n"
             "         --deviceType gpu\n"
             "         --deviceIndex 0\n"
+            "         --gpuInFlightTasks 0\n"
             "         --inputGammaNumerator 1.0\n"
             "         --inputGammaDenominator 1.0\n"
             "         --outputGammaNumerator 1.0\n"
@@ -879,6 +884,7 @@ void printHelp()
             "          accelerator\n"
             "          default\n"
             "    --deviceIndex <uint>               If there are multiple devices of chosen vendor and type, <uint> is used for selection. There is no support for multiple OpenCL devices for now. [radiance filter param]\n"
+            "    --gpuInFlightTasks <uint>          Number of OpenCL tasks kept in flight for radiance GPU processing. 0 uses default behavior; values above 2 are clamped. [radiance filter param]\n"
             "    --generateMipChain <bool>          After processing, generate entire mip map chain.\n"
             "    --inputGammaNumerator <uint>       Gamma applied to cubemap before processing. Use this field to specify gamma numerator. Gamma equation is value^(numerator/denominator).\n"
             "    --inputGammaDenominator <uint>     Gamma applied to cubemap before processing. Use this field to specify gamma denominator. Gamma equation is value^(numerator/denominator).\n"

@@ -265,6 +265,8 @@ namespace cmft
             }
 
             // Start filter.
+            const uint8_t gpuInFlightTasks = uint8_t(CMFT_MIN(_request.m_gpuInFlightTasks, uint32_t(255)));
+            imageRadianceSetGpuInFlightTasks(gpuInFlightTasks);
             imageRadianceFilter(image
                               , _request.m_dstFaceSize
                               , _request.m_lightingModel

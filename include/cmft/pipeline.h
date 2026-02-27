@@ -85,6 +85,7 @@ namespace cmft
 
             // Processing devices.
             m_numCpuProcessingThreads = UINT32_MAX;
+            m_gpuInFlightTasks        = 0;
             m_useOpenCL               = true;
             m_clVendor                = CMFT_CL_VENDOR_ANY_GPU;
             m_vendorStrPart           = NULL;
@@ -139,6 +140,7 @@ namespace cmft
 
         // Processing devices.
         uint32_t m_numCpuProcessingThreads;
+        uint32_t m_gpuInFlightTasks;
         bool m_useOpenCL;
         uint32_t m_clVendor;
         const char* m_vendorStrPart;

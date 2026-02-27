@@ -40,6 +40,7 @@ request.m_lightingModel = cmft::LightingModel::PhongBrdf;
 
 request.m_processingMode = cmft::RadianceFilterProcessing::GpuOnly;
 request.m_numCpuProcessingThreads = 0;
+request.m_gpuInFlightTasks = 0; // 0 = default behavior
 request.m_useOpenCL = true;
 
 request.m_outputFilesNum = 1;
@@ -60,12 +61,13 @@ Radiance processing modes
 - `cpuOnly` requires at least one CPU processing thread.
 - `hybrid` requires both CPU threads and a valid OpenCL GPU context.
 - `gpuOnly` is strict: no CPU fallback is used if GPU processing fails.
+- `--gpuInFlightTasks` controls how many GPU radiance tasks are kept in flight (`0` keeps default behavior; values above `2` are clamped).
 
 CLI examples:
 
 ```
-cmft --input "studio.hdr" --filter radiance --processingMode gpuOnly --numCpuProcessingThreads 0 --useOpenCL true --outputNum 1 --output0 "studio_pmrem" --output0params dds,bgra8,cubemap
-cmft --input "studio.hdr" --filter radiance --processingMode hybrid --numCpuProcessingThreads 4 --useOpenCL true --outputNum 1 --output0 "studio_pmrem" --output0params dds,bgra8,cubemap
+cmft --input "studio.hdr" --filter radiance --processingMode gpuOnly --numCpuProcessingThreads 0 --gpuInFlightTasks 0 --useOpenCL true --outputNum 1 --output0 "studio_pmrem" --output0params dds,bgra8,cubemap
+cmft --input "studio.hdr" --filter radiance --processingMode hybrid --numCpuProcessingThreads 4 --gpuInFlightTasks 0 --useOpenCL true --outputNum 1 --output0 "studio_pmrem" --output0params dds,bgra8,cubemap
 ```
 
 
@@ -81,6 +83,12 @@ cmft --input "studio.hdr" --filter radiance --srcFaceSize 1024 --dstFaceSize 256
 ```
 
 For stable numbers, run once as warm-up, then run each command 3 times and compare the average `Radiance -> Total time` reported by cmft.
+
+You can also sweep in-flight depth automatically with:
+
+```
+python runtime/bench_gpu_inflight.py --input runtime/okretnica.tga --runs 3 --depths 0 1 2
+```
 
 
 See it in action - [here](https://github.com/dariomanesku/cmftStudio)

@@ -81,6 +81,10 @@ namespace cmft
     float specularPowerFor(float _mip, float _mipCount, float _glossScale, float _glossBias);
     float applyLightningModel(float _specularPower, LightingModel::Enum _lightingModel);
 
+    /// Sets number of in-flight GPU radiance tasks.
+    /// Value 0 uses the default automatic depth.
+    void imageRadianceSetGpuInFlightTasks(uint8_t _gpuInFlightTasks = 0);
+
     struct ClContext;
 
     /// Creates radiance cubemap image.
