@@ -69,6 +69,20 @@ cmft --input "studio.hdr" --filter radiance --processingMode hybrid --numCpuProc
 ```
 
 
+Benchmark presets (CLI)
+------------
+
+Use identical filter settings and only change `--processingMode`:
+
+```
+cmft --input "studio.hdr" --filter radiance --srcFaceSize 1024 --dstFaceSize 256 --lightingModel phongbrdf --mipCount 9 --glossScale 10 --glossBias 1 --excludeBase false --edgeFixup none --processingMode gpuOnly --numCpuProcessingThreads 0 --useOpenCL true --outputNum 1 --output0 "bench_gpu" --output0params dds,bgra8,cubemap
+cmft --input "studio.hdr" --filter radiance --srcFaceSize 1024 --dstFaceSize 256 --lightingModel phongbrdf --mipCount 9 --glossScale 10 --glossBias 1 --excludeBase false --edgeFixup none --processingMode hybrid --numCpuProcessingThreads 8 --useOpenCL true --outputNum 1 --output0 "bench_hybrid" --output0params dds,bgra8,cubemap
+cmft --input "studio.hdr" --filter radiance --srcFaceSize 1024 --dstFaceSize 256 --lightingModel phongbrdf --mipCount 9 --glossScale 10 --glossBias 1 --excludeBase false --edgeFixup none --processingMode cpuOnly --numCpuProcessingThreads 8 --useOpenCL false --outputNum 1 --output0 "bench_cpu" --output0params dds,bgra8,cubemap
+```
+
+For stable numbers, run once as warm-up, then run each command 3 times and compare the average `Radiance -> Total time` reported by cmft.
+
+
 See it in action - [here](https://github.com/dariomanesku/cmftStudio)
 ------------
 Screenshot from [cmftStudio](https://github.com/dariomanesku/cmftStudio):
