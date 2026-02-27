@@ -1172,9 +1172,15 @@ namespace cmft
             m_sum             = NULL;
             m_event           = NULL;
             m_transferQueue   = NULL;
-            m_memOut          = NULL;
+            m_memOut[0]       = NULL;
+            m_memOut[1]       = NULL;
+            m_memOutReadEvent[0] = NULL;
+            m_memOutReadEvent[1] = NULL;
+            m_memOutWriteIdx  = 0;
             m_prevDstFaceSize = 0;
             m_srcFaceSize     = 0.0f;
+            m_localWorkSize[0] = 8;
+            m_localWorkSize[1] = 8;
             m_computeFilterAreaOnCpu = (CMFT_COMPUTE_FILTER_AREA_ON_CPU != 0);
             m_asyncReadback = false;
             m_memFaceData[0]  = NULL;
@@ -1200,6 +1206,7 @@ namespace cmft
             }
 
             m_clContext = _clContext;
+            updateLocalWorkSizeTuning();
         }
 
         void setComputeFilterAreaOnCpu(bool _enabled)
@@ -1219,6 +1226,56 @@ namespace cmft
                 clReleaseEvent(m_event);
             }
             m_event = _event;
+        }
+
+        void updateLocalWorkSizeTuning()
+        {
+            m_localWorkSize[0] = 8;
+            m_localWorkSize[1] = 8;
+
+            if (NULL == m_clContext
+            || 0 == (m_clContext->m_deviceType & CL_DEVICE_TYPE_GPU))
+            {
+                return;
+            }
+
+            size_t preferredX = 8;
+            size_t preferredY = 8;
+
+            if (NULL != cmft::stristr(m_clContext->m_deviceVendor, "nvidia"))
+            {
+                preferredX = 16;
+                preferredY = 8;
+            }
+
+            size_t maxWorkGroupSize = 0;
+            size_t maxWorkItemSize[3] = { 0, 0, 0 };
+            if (CL_SUCCESS != clGetDeviceInfo(m_clContext->m_device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(maxWorkGroupSize), &maxWorkGroupSize, NULL)
+            ||  CL_SUCCESS != clGetDeviceInfo(m_clContext->m_device, CL_DEVICE_MAX_WORK_ITEM_SIZES, sizeof(maxWorkItemSize), maxWorkItemSize, NULL))
+            {
+                return;
+            }
+
+            const bool preferredValid = (preferredX <= maxWorkItemSize[0])
+                                     && (preferredY <= maxWorkItemSize[1])
+                                     && (preferredX*preferredY <= maxWorkGroupSize)
+                                     ;
+            if (preferredValid)
+            {
+                m_localWorkSize[0] = preferredX;
+                m_localWorkSize[1] = preferredY;
+                return;
+            }
+
+            const bool fallbackValid = (8 <= maxWorkItemSize[0])
+                                    && (8 <= maxWorkItemSize[1])
+                                    && (64 <= maxWorkGroupSize)
+                                    ;
+            if (!fallbackValid)
+            {
+                m_localWorkSize[0] = 0;
+                m_localWorkSize[1] = 0;
+            }
         }
 
         bool hasValidDeviceContext() const
@@ -1250,6 +1307,23 @@ namespace cmft
                 clReleaseCommandQueue(m_transferQueue);
                 m_transferQueue = NULL;
             }
+
+            for (uint8_t ii = 0; ii < 2; ++ii)
+            {
+                if (NULL != m_memOut[ii])
+                {
+                    clReleaseMemObject(m_memOut[ii]);
+                    m_memOut[ii] = NULL;
+                }
+
+                if (NULL != m_memOutReadEvent[ii])
+                {
+                    clReleaseEvent(m_memOutReadEvent[ii]);
+                    m_memOutReadEvent[ii] = NULL;
+                }
+            }
+
+            m_memOutWriteIdx = 0;
         }
 
         bool createFromStr(const char* _source, size_t _sourceSize, const char* _header, size_t _headerSize)
@@ -1447,28 +1521,51 @@ namespace cmft
 
             const float warp = warpFixupFactor(float(int32_t(_dstFaceSize)));
             const size_t bytesPerPixel = 4 /*numChannels*/ * 4 /*bytesPerChannel*/;
-            const size_t localWorkSize[2] = { 8, 8 };
-
             // Create output image.
             if (m_prevDstFaceSize != _dstFaceSize)
             {
-                if (NULL != m_memOut)
+                for (uint8_t ii = 0; ii < 2; ++ii)
                 {
-                    clReleaseMemObject(m_memOut);
+                    if (NULL != m_memOutReadEvent[ii])
+                    {
+                        CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &m_memOutReadEvent[ii]));
+                        clReleaseEvent(m_memOutReadEvent[ii]);
+                        m_memOutReadEvent[ii] = NULL;
+                    }
+
+                    if (NULL != m_memOut[ii])
+                    {
+                        clReleaseMemObject(m_memOut[ii]);
+                        m_memOut[ii] = NULL;
+                    }
                 }
 
-                m_memOut = clCreateImage2D(m_clContext->m_context
-                                         , CL_MEM_WRITE_ONLY
-                                         , &sc_imageFormat
-                                         , _dstFaceSize
-                                         , _dstFaceSize
-                                         , 0
-                                         , NULL
-                                         , &err
-                                         );
+                m_prevDstFaceSize = _dstFaceSize;
+            }
+
+            const uint8_t outIdx = m_asyncReadback ? uint8_t(m_memOutWriteIdx++ & 1) : 0;
+            if (NULL != m_memOutReadEvent[outIdx])
+            {
+                CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &m_memOutReadEvent[outIdx]));
+                clReleaseEvent(m_memOutReadEvent[outIdx]);
+                m_memOutReadEvent[outIdx] = NULL;
+            }
+
+            if (NULL == m_memOut[outIdx])
+            {
+                m_memOut[outIdx] = clCreateImage2D(m_clContext->m_context
+                                                 , CL_MEM_WRITE_ONLY
+                                                 , &sc_imageFormat
+                                                 , _dstFaceSize
+                                                 , _dstFaceSize
+                                                 , 0
+                                                 , NULL
+                                                 , &err
+                                                 );
                 CL_CHECK_RETURN(err);
             }
-            m_prevDstFaceSize = _dstFaceSize;
+
+            cl_mem outImage = m_memOut[outIdx];
 
             cl_mem area = NULL;
             if (m_computeFilterAreaOnCpu)
@@ -1492,7 +1589,7 @@ namespace cmft
             CMFT_UNUSED(_edgeFixup);
 
             // Set arguments.
-            CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter,  0, sizeof(cl_mem),  (const void*)&m_memOut));
+            CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter,  0, sizeof(cl_mem),  (const void*)&outImage));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter,  1, sizeof(int32_t), (const void*)&_dstFaceSize));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter,  2, sizeof(float),   (const void*)&_specularPower));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_radFilter,  3, sizeof(float),   (const void*)&_specularAngle));
@@ -1532,7 +1629,11 @@ namespace cmft
                         CMFT_MIN(tileSize, _dstFaceSize-workOffset[1]),
                     };
                     const bool isLastTile = (yy == (count-1) && xx == (count-1));
-                    const size_t* local = (tileSize == workSize[0] && tileSize == workSize[1]) ? localWorkSize : NULL;
+                    const bool localSupported = (0 != m_localWorkSize[0] && 0 != m_localWorkSize[1])
+                                             && (0 == (workSize[0] % m_localWorkSize[0]))
+                                             && (0 == (workSize[1] % m_localWorkSize[1]))
+                                             ;
+                    const size_t* local = localSupported ? m_localWorkSize : NULL;
                     CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
                                                               , m_radFilter
                                                               , 2
@@ -1556,7 +1657,7 @@ namespace cmft
             const cl_uint waitCount = (readQueue == m_transferQueue && NULL != kernelEvent) ? 1 : 0;
             const cl_event* waitEvents = (0 == waitCount) ? NULL : &kernelEvent;
             CL_CHECK_EXPR_RETURN(clEnqueueReadImage(readQueue
-                                                  , m_memOut
+                                                  , outImage
                                                   , CL_FALSE
                                                   , origin
                                                   , region
@@ -1577,6 +1678,8 @@ namespace cmft
             {
                 CL_CHECK_EXPR_RETURN(clFlush(m_clContext->m_commandQueue));
                 CL_CHECK_EXPR_RETURN(clFlush(readQueue));
+                m_memOutReadEvent[outIdx] = readEvent;
+                CL_CHECK_EXPR_RETURN(clRetainEvent(readEvent));
                 setEvent(readEvent);
             }
             else
@@ -1608,7 +1711,6 @@ namespace cmft
             const float warp = warpFixupFactor(float(int32_t(_dstFaceSize)));
             const size_t workSize[2] = { _dstFaceSize, _dstFaceSize };
             const size_t bytesPerPixel = 4 /*numChannels*/ * 4 /*bytesPerChannel*/;
-            const size_t localWorkSize[2] = { 8, 8 };
 
             cl_mem area = NULL;
             if (m_computeFilterAreaOnCpu)
@@ -1677,7 +1779,11 @@ namespace cmft
                             CMFT_MIN(tileSize, _dstFaceSize-tileWorkOffset[0]),
                             CMFT_MIN(tileSize, _dstFaceSize-tileWorkOffset[1]),
                         };
-                        const size_t* local = (tileSize == tileWorkSize[0] && tileSize == tileWorkSize[1]) ? localWorkSize : NULL;
+                        const bool localSupported = (0 != m_localWorkSize[0] && 0 != m_localWorkSize[1])
+                                                 && (0 == (tileWorkSize[0] % m_localWorkSize[0]))
+                                                 && (0 == (tileWorkSize[1] % m_localWorkSize[1]))
+                                                 ;
+                        const size_t* local = localSupported ? m_localWorkSize : NULL;
                         CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
                                                                   , m_radFilterSingle
                                                                   , 2
@@ -1695,25 +1801,50 @@ namespace cmft
             // Sum partial results.
             if (m_prevDstFaceSize != _dstFaceSize)
             {
-                if (NULL != m_memOut)
+                for (uint8_t ii = 0; ii < 2; ++ii)
                 {
-                    clReleaseMemObject(m_memOut);
+                    if (NULL != m_memOutReadEvent[ii])
+                    {
+                        CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &m_memOutReadEvent[ii]));
+                        clReleaseEvent(m_memOutReadEvent[ii]);
+                        m_memOutReadEvent[ii] = NULL;
+                    }
+
+                    if (NULL != m_memOut[ii])
+                    {
+                        clReleaseMemObject(m_memOut[ii]);
+                        m_memOut[ii] = NULL;
+                    }
                 }
 
-                m_memOut = clCreateImage2D(m_clContext->m_context
-                                         , CL_MEM_WRITE_ONLY
-                                         , &sc_imageFormat
-                                         , _dstFaceSize
-                                         , _dstFaceSize
-                                         , 0
-                                         , NULL
-                                         , &err
-                                         );
+                m_prevDstFaceSize = _dstFaceSize;
+            }
+
+            const uint8_t outIdx = m_asyncReadback ? uint8_t(m_memOutWriteIdx++ & 1) : 0;
+            if (NULL != m_memOutReadEvent[outIdx])
+            {
+                CL_CHECK_EXPR_RETURN(clWaitForEvents(1, &m_memOutReadEvent[outIdx]));
+                clReleaseEvent(m_memOutReadEvent[outIdx]);
+                m_memOutReadEvent[outIdx] = NULL;
+            }
+
+            if (NULL == m_memOut[outIdx])
+            {
+                m_memOut[outIdx] = clCreateImage2D(m_clContext->m_context
+                                                 , CL_MEM_WRITE_ONLY
+                                                 , &sc_imageFormat
+                                                 , _dstFaceSize
+                                                 , _dstFaceSize
+                                                 , 0
+                                                 , NULL
+                                                 , &err
+                                                 );
                 CL_CHECK_RETURN(err);
             }
-            m_prevDstFaceSize = _dstFaceSize;
 
-            CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 0, sizeof(cl_mem), (const void*)&m_memOut));
+            cl_mem outImage = m_memOut[outIdx];
+
+            CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 0, sizeof(cl_mem), (const void*)&outImage));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 1, sizeof(cl_mem), (const void*)&faces[0]));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 2, sizeof(cl_mem), (const void*)&faces[1]));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 3, sizeof(cl_mem), (const void*)&faces[2]));
@@ -1721,7 +1852,11 @@ namespace cmft
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 5, sizeof(cl_mem), (const void*)&faces[4]));
             CL_CHECK_EXPR_RETURN(clSetKernelArg(m_sum, 6, sizeof(cl_mem), (const void*)&faces[5]));
 
-            const size_t* localSum = (0 == (_dstFaceSize & 7)) ? localWorkSize : NULL;
+            const bool localSumSupported = (0 != m_localWorkSize[0] && 0 != m_localWorkSize[1])
+                                        && (0 == (_dstFaceSize % m_localWorkSize[0]))
+                                        && (0 == (_dstFaceSize % m_localWorkSize[1]))
+                                        ;
+            const size_t* localSum = localSumSupported ? m_localWorkSize : NULL;
             cl_event sumEvent = NULL;
             CL_CHECK_EXPR_RETURN(clEnqueueNDRangeKernel(m_clContext->m_commandQueue
                                                       , m_sum
@@ -1745,7 +1880,7 @@ namespace cmft
             const cl_uint waitCount = (readQueue == m_transferQueue && NULL != sumEvent) ? 1 : 0;
             const cl_event* waitEvents = (0 == waitCount) ? NULL : &sumEvent;
             CL_CHECK_EXPR_RETURN(clEnqueueReadImage(readQueue
-                                                  , m_memOut
+                                                  , outImage
                                                   , CL_FALSE
                                                   , origin
                                                   , region
@@ -1766,6 +1901,8 @@ namespace cmft
             {
                 CL_CHECK_EXPR_RETURN(clFlush(m_clContext->m_commandQueue));
                 CL_CHECK_EXPR_RETURN(clFlush(readQueue));
+                m_memOutReadEvent[outIdx] = readEvent;
+                CL_CHECK_EXPR_RETURN(clRetainEvent(readEvent));
                 setEvent(readEvent);
             }
             else
@@ -1826,7 +1963,8 @@ namespace cmft
         void releaseDeviceMemory()
         {
         #define RELEASE_CL_MEM(_mem) do { if (NULL != _mem) { clReleaseMemObject(_mem); _mem = NULL; } } while (0)
-            RELEASE_CL_MEM(m_memOut);
+            RELEASE_CL_MEM(m_memOut[0]);
+            RELEASE_CL_MEM(m_memOut[1]);
             RELEASE_CL_MEM(m_memFaceData[0]);
             RELEASE_CL_MEM(m_memFaceData[1]);
             RELEASE_CL_MEM(m_memFaceData[2]);
@@ -1839,6 +1977,20 @@ namespace cmft
             RELEASE_CL_MEM(m_memNormalSolidAngle[3]);
             RELEASE_CL_MEM(m_memNormalSolidAngle[4]);
             RELEASE_CL_MEM(m_memNormalSolidAngle[5]);
+
+            if (NULL != m_memOutReadEvent[0])
+            {
+                clReleaseEvent(m_memOutReadEvent[0]);
+                m_memOutReadEvent[0] = NULL;
+            }
+
+            if (NULL != m_memOutReadEvent[1])
+            {
+                clReleaseEvent(m_memOutReadEvent[1]);
+                m_memOutReadEvent[1] = NULL;
+            }
+
+            m_memOutWriteIdx = 0;
         #undef RELEASE_CL_MEM
         }
 
@@ -1862,6 +2014,23 @@ namespace cmft
                 clReleaseCommandQueue(m_transferQueue);
                 m_transferQueue = NULL;
             }
+
+            for (uint8_t ii = 0; ii < 2; ++ii)
+            {
+                if (NULL != m_memOut[ii])
+                {
+                    clReleaseMemObject(m_memOut[ii]);
+                    m_memOut[ii] = NULL;
+                }
+
+                if (NULL != m_memOutReadEvent[ii])
+                {
+                    clReleaseEvent(m_memOutReadEvent[ii]);
+                    m_memOutReadEvent[ii] = NULL;
+                }
+            }
+
+            m_memOutWriteIdx = 0;
         #undef RELEASE_CL_KERNEL
         #undef RELEASE_CL_PROG
         }
@@ -1873,9 +2042,12 @@ namespace cmft
         cl_kernel m_sum;
         cl_event m_event;
         cl_command_queue m_transferQueue;
-        cl_mem m_memOut;
+        cl_mem m_memOut[2];
+        cl_event m_memOutReadEvent[2];
+        uint8_t m_memOutWriteIdx;
         uint32_t m_prevDstFaceSize;
         float m_srcFaceSize;
+        size_t m_localWorkSize[2];
         bool m_computeFilterAreaOnCpu;
         bool m_asyncReadback;
         cl_mem m_memFaceData[6];
