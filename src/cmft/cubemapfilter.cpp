@@ -2316,14 +2316,21 @@ namespace cmft
         const uint32_t maxActiveCpuThreads = (uint32_t)CMFT_CLAMP(_numCpuProcessingThreads, 0, 64);
 
         // Prepare OpenCL kernel and device memory.
-        const bool forceGpuFilterArea = (RadianceFilterProcessing::GpuOnly == _processingMode);
-        const bool computeFilterAreaOnCpu = forceGpuFilterArea
-                                          ? false
-                                          : (CMFT_COMPUTE_FILTER_AREA_ON_CPU != 0)
-                                          ;
+        const bool gpuOnlyMode = (RadianceFilterProcessing::GpuOnly == _processingMode);
+        bool computeFilterAreaOnCpu = (CMFT_COMPUTE_FILTER_AREA_ON_CPU != 0);
+        bool enableAsyncReadback = false;
+
+        if (gpuOnlyMode)
+        {
+            // Stability guard:
+            // - Keep filter-area computation on CPU to avoid very large OpenCL kernels in strict GPU-only mode.
+            // - Disable async readback queue overlap to avoid driver stalls observed on some systems.
+            computeFilterAreaOnCpu = true;
+            enableAsyncReadback = false;
+        }
 
         s_radianceProgram.setComputeFilterAreaOnCpu(computeFilterAreaOnCpu);
-        s_radianceProgram.setAsyncReadback(RadianceFilterProcessing::GpuOnly == _processingMode);
+        s_radianceProgram.setAsyncReadback(enableAsyncReadback);
         s_radianceProgram.setDeviceContext(_clContext);
         if (s_radianceProgram.hasValidDeviceContext())
         {
